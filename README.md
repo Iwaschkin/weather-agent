@@ -95,6 +95,19 @@ Type `exit` or press Ctrl-C to quit.
 
 The host and model tag can be overridden via `build_agent(host=..., model_id=...)`.
 
+## Configuration
+
+The weather, climate, air-quality, marine, and pollen tools need no API key. The
+airspace tool is the only exception: it uses [OpenAIP](https://www.openaip.net),
+which needs a free key. Copy `.env.example` to `.env` (git-ignored) and set:
+
+```shell
+OPENAIP_API_KEY=your-key-here
+```
+
+The CLI loads `.env` automatically. Without a key, every other tool works
+normally and the airspace lookup degrades to an "unavailable" note.
+
 ## Development
 
 This repository follows the `python-quality-baseline` (see `AGENTS.md`).

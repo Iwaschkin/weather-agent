@@ -10,6 +10,8 @@ the agent's sliding-window manager trims the oldest turns.
 import logging
 import sys
 
+from dotenv import load_dotenv
+
 from weather_agent.agent import build_agent
 
 _DEFAULT_PROMPT = "What is the current weather in Berlin?"
@@ -67,8 +69,11 @@ def main() -> None:
     ``weather-agent chat`` starts the interactive memory-retaining session;
     any other arguments are joined into a single prompt and answered once.
     Requires a reachable Ollama server, since the agent calls a local LLM.
+    Loads variables from a local ``.env`` first, so an optional ``OPENAIP_API_KEY``
+    (used only by the airspace tool) is available to the boundary that reads it.
     """
     logging.basicConfig(level=logging.WARNING)
+    _ = load_dotenv()
     args = sys.argv[1:]
     if args and args[0] == _CHAT_COMMAND:
         _run_chat()
