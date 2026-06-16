@@ -1,0 +1,234 @@
+"""Tests for the pure open-meteo payload parsers."""
+
+import pytest
+
+from weather_agent.parsing import (
+    OpenMeteoError,
+    parse_current_readings,
+    parse_current_weather,
+    parse_elevation,
+    parse_geocode_results,
+    parse_time_series,
+)
+
+
+def test_parse_geocode_results_extracts_fields() -> None:
+    """A well-formed geocoding payload yields a typed result."""
+    payload: dict[str, object] = {
+        "results": [
+            {
+                "name": "Berlin",
+                "country": "Germany",
+                "latitude": 52.52,
+                "longitude": 13.41,
+            },
+        ],
+    }
+
+    results = parse_geocode_results(payload)
+
+    assert len(results) == 1
+    assert results[0].name == "Berlin"
+    assert results[0].country == "Germany"
+    assert results[0].latitude == 52.52
+    assert results[0].longitude == 13.41
+
+
+def test_parse_geocode_results_extracts_disambiguation_fields() -> None:
+    """Country code, region, and population are parsed when present."""
+    payload: dict[str, object] = {
+        "results": [
+            {
+                "name": "Congleton",
+                "country": "United Kingdom",
+                "country_code": "GB",
+                "admin1": "England",
+                "population": 26482,
+                "latitude": 53.16,
+                "longitude": -2.21,
+            },
+        ],
+    }
+
+    result = parse_geocode_results(payload)[0]
+
+    assert result.country_code == "GB"
+    assert result.admin1 == "England"
+    assert result.population == 26482
+
+
+def test_parse_geocode_results_defaults_disambiguation_fields() -> None:
+    """Missing disambiguation fields fall back to empty/None."""
+    payload: dict[str, object] = {
+        "results": [{"name": "Nowhere", "latitude": 0.0, "longitude": 0.0}],
+    }
+
+    result = parse_geocode_results(payload)[0]
+
+    assert result.country_code == ""
+    assert result.admin1 == ""
+    assert result.population is None
+
+
+def test_parse_geocode_results_missing_results_is_empty() -> None:
+    """The geocoding API omits 'results' when nothing matches."""
+    assert parse_geocode_results({}) == []
+
+
+def test_parse_geocode_results_defaults_missing_country() -> None:
+    """A match without a country falls back to an empty string."""
+    payload: dict[str, object] = {
+        "results": [{"name": "Nowhere", "latitude": 0.0, "longitude": 0.0}],
+    }
+
+    results = parse_geocode_results(payload)
+
+    assert results[0].country == ""
+
+
+_MALFORMED_GEOCODE: list[object] = [
+    "not-a-mapping",
+    {"results": "not-a-list"},
+    {"results": [{"name": "X", "latitude": "nan", "longitude": 0.0}]},
+    {"results": [{"latitude": 1.0, "longitude": 2.0}]},
+]
+
+
+@pytest.mark.parametrize("payload", _MALFORMED_GEOCODE)
+def test_parse_geocode_results_rejects_malformed(payload: object) -> None:
+    """Malformed geocoding payloads raise a domain error."""
+    with pytest.raises(OpenMeteoError):
+        _ = parse_geocode_results(payload)
+
+
+def test_parse_current_weather_extracts_fields() -> None:
+    """A well-formed forecast payload yields typed current weather."""
+    payload: dict[str, object] = {
+        "current": {
+            "time": "2026-06-15T12:00",
+            "temperature_2m": 21.3,
+            "wind_speed_10m": 9.7,
+        },
+    }
+
+    weather = parse_current_weather(payload)
+
+    assert weather.time == "2026-06-15T12:00"
+    assert weather.temperature_celsius == 21.3
+    assert weather.wind_speed_kmh == 9.7
+
+
+_MALFORMED_FORECAST: list[object] = [
+    {},
+    {"current": {"temperature_2m": 1.0, "wind_speed_10m": 2.0}},
+    {"current": {"time": "t", "temperature_2m": True, "wind_speed_10m": 2.0}},
+]
+
+
+@pytest.mark.parametrize("payload", _MALFORMED_FORECAST)
+def test_parse_current_weather_rejects_malformed(payload: object) -> None:
+    """Malformed forecast payloads raise a domain error."""
+    with pytest.raises(OpenMeteoError):
+        _ = parse_current_weather(payload)
+
+
+def test_parse_current_readings_extracts_present_hour() -> None:
+    """The current block yields the present-hour scalars, ignoring metadata."""
+    payload: dict[str, object] = {
+        "current": {
+            "time": "2026-06-15T13:00",
+            "interval": 3600,
+            "pm2_5": 12.0,
+            "european_aqi": 33.0,
+            "ozone": None,
+        },
+    }
+
+    readings = parse_current_readings(payload)
+
+    assert readings.time == "2026-06-15T13:00"
+    assert readings.values == {"pm2_5": 12.0, "european_aqi": 33.0, "ozone": None}
+    assert "interval" not in readings.values
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        "not-a-mapping",
+        {},
+        {"current": {"pm2_5": 1.0}},
+        {"current": {"time": 12, "pm2_5": 1.0}},
+    ],
+)
+def test_parse_current_readings_rejects_malformed(payload: object) -> None:
+    """A missing or malformed current block raises a domain error."""
+    with pytest.raises(OpenMeteoError):
+        _ = parse_current_readings(payload)
+
+
+def test_parse_time_series_extracts_columns() -> None:
+    """A well-formed block yields aligned timestamps and variable columns."""
+    payload: dict[str, object] = {
+        "daily": {
+            "time": ["2026-06-14", "2026-06-15"],
+            "temperature_2m_max": [21.0, 23.5],
+            "precipitation_sum": [0.0, 4.2],
+        },
+    }
+
+    series = parse_time_series(payload, "daily")
+
+    assert series.timestamps == ("2026-06-14", "2026-06-15")
+    assert series.column("temperature_2m_max") == (21.0, 23.5)
+    assert series.column("precipitation_sum") == (0.0, 4.2)
+    assert "time" not in series.series
+
+
+def test_parse_time_series_preserves_null_gaps() -> None:
+    """Open-meteo emits null for missing samples, preserved as None."""
+    payload: dict[str, object] = {
+        "hourly": {"time": ["2026-06-14T00:00", "2026-06-14T01:00"], "cloud_cover": [55.0, None]},
+    }
+
+    series = parse_time_series(payload, "hourly")
+
+    assert series.column("cloud_cover") == (55.0, None)
+
+
+_MALFORMED_TIME_SERIES: list[object] = [
+    {},
+    {"hourly": "not-a-mapping"},
+    {"hourly": {"temperature_2m": [1.0]}},
+    {"hourly": {"time": "not-a-list", "temperature_2m": [1.0]}},
+    {"hourly": {"time": ["t1", "t2"], "temperature_2m": [1.0]}},
+    {"hourly": {"time": ["t1"], "temperature_2m": ["warm"]}},
+    {"hourly": {"time": [1, 2], "temperature_2m": [1.0, 2.0]}},
+]
+
+
+@pytest.mark.parametrize("payload", _MALFORMED_TIME_SERIES)
+def test_parse_time_series_rejects_malformed(payload: object) -> None:
+    """Malformed or ragged time-series payloads raise a domain error."""
+    with pytest.raises(OpenMeteoError):
+        _ = parse_time_series(payload, "hourly")
+
+
+def test_parse_elevation_extracts_first_value() -> None:
+    """A well-formed elevation payload yields the first metre value."""
+    assert parse_elevation({"elevation": [38.0, 39.0]}).meters == 38.0
+
+
+_MALFORMED_ELEVATION: list[object] = [
+    {},
+    {"elevation": "not-a-list"},
+    {"elevation": []},
+    {"elevation": [None]},
+    {"elevation": ["high"]},
+]
+
+
+@pytest.mark.parametrize("payload", _MALFORMED_ELEVATION)
+def test_parse_elevation_rejects_malformed(payload: object) -> None:
+    """Malformed elevation payloads raise a domain error."""
+    with pytest.raises(OpenMeteoError):
+        _ = parse_elevation(payload)

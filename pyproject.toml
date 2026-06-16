@@ -1,0 +1,251 @@
+[project]
+name = "weather-agent"
+version = "0.1.0"
+description = "A Strands agent that interacts with the open-meteo.com weather API."
+readme = "README.md"
+authors = [
+    { name = "Iwaschkin", email = "david.iwaschkin@pm.me" }
+]
+requires-python = ">=3.14"
+dependencies = [
+    "httpx>=0.28.1",
+    "strands-agents[ollama]>=1.43.0",
+    "tzdata>=2026.2",
+]
+
+[project.scripts]
+weather-agent = "weather_agent.cli:main"
+
+[build-system]
+requires = ["uv_build>=0.11.21,<0.12.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pre-commit>=4.6.0",
+    "pyright>=1.1.410",
+    "pytest>=9.1.0",
+    "pytest-cov>=7.1.0",
+    "ruff>=0.15.17",
+]
+
+[tool.ruff]
+# Explicit line length to avoid relying on defaults and to align CI/editor behaviour
+line-length = 100
+
+[tool.ruff.lint]
+select = [
+    # Core correctness and style
+    "E",     # pycodestyle errors
+    "F",     # pyflakes
+    "W",     # pycodestyle warnings
+    "I",     # import sorting
+    "N",     # naming conventions
+
+    # Documentation and typing discipline
+    "D",     # docstrings
+    "ANN",   # type annotations
+
+    # Security and correctness
+    "S",     # security (bandit-style)
+    "B",     # bugbear
+    "A",     # builtins shadowing
+
+    # Code quality and simplification
+    "C4",    # comprehensions
+    "C90",   # complexity (McCabe)
+    "RET",   # return patterns
+    "SIM",   # simplifications
+    "PIE",   # misc useful rules
+    "PL",    # pylint-derived rules (broad and strict)
+
+    # Modernisation and cleanup
+    "UP",    # pyupgrade
+    "COM",   # commas
+    "RUF",   # Ruff-native rules
+    "ARG",   # unused arguments
+    "PTH",   # pathlib over os.path
+    "ERA",   # commented-out code
+
+    # Error handling and structure
+    "TRY",   # exception improvements
+    "TC",    # type-checking import hygiene (renamed from TCH in Ruff 0.8)
+
+    # Testing and async
+    "PT",    # pytest style
+    "ASYNC", # async correctness
+
+    # Anti-slop additions (high value for AI code)
+    "BLE",   # blocks blind exception handling
+    "FBT",   # forces clearer function APIs (no boolean traps)
+    "DTZ",   # timezone-safe datetime usage
+    "LOG",   # structured logging practices
+    "G",     # correct logging formatting
+    "TID",   # import hygiene and boundaries
+    "T20",   # ban print statements
+    "EM",    # better exception messages
+    "ISC",   # prevents accidental implicit string concatenation (missing commas)
+
+    # Optional but useful (kept enabled here for strict baseline)
+    "ICN",   # import naming conventions (np, pd, etc.)
+    "PERF",  # performance anti-patterns
+    "FLY",   # enforce f-strings
+    "PGH",   # miscellaneous pattern checks
+]
+
+ignore = [
+    "D203",   # conflicts with chosen docstring style
+    "D213",   # alternative summary placement rule
+    "COM812", # conflicts with the formatter (trailing commas)
+    "ISC001", # conflicts with the formatter (single-line implicit concat)
+]
+
+[tool.ruff.lint.flake8-tidy-imports.banned-api]
+"typing.Any" = { msg = "Use a concrete type or a Protocol instead." }
+
+[tool.ruff.lint.pylint]
+# Hard caps to prevent large, messy AI-generated functions
+max-args = 5
+max-branches = 8
+max-returns = 5
+max-statements = 25
+
+[tool.ruff.lint.pydocstyle]
+# Enforce consistent docstring style across the project
+convention = "google"
+
+[tool.ruff.lint.mccabe]
+# Lower than typical defaults to force decomposition early
+max-complexity = 8
+
+[tool.ruff.lint.per-file-ignores]
+# The interactive chat REPL legitimately writes prompts and separators to
+# stdout, so allow print in the CLI wiring module only.
+"src/weather_agent/cli.py" = ["T201"]
+# Tests keep docstring and annotation discipline, but drop the rules that
+# punish normal pytest idioms instead of catching real problems:
+#   S101    assert is the pytest norm
+#   PLR2004 literal expected values in assertions are not magic numbers
+#   S105/S106 dummy secrets in fixtures are not real credentials
+"tests/**/*.py" = ["S101", "PLR2004", "S105", "S106"]
+
+[tool.ruff.format]
+# Explicit formatter behaviour for consistency across environments
+quote-style = "double"
+indent-style = "space"
+line-ending = "lf"
+
+[tool.pyright]
+pythonVersion = "3.14"
+typeCheckingMode = "standard"
+
+include = [
+    "src",
+    "tests",
+]
+
+exclude = [
+    "**/node_modules",
+    "**/__pycache__",
+    "**/.venv*",
+    "build",
+    "dist",
+    "*.egg-info",
+]
+
+# Strict mode only where production code lives.
+strict = [
+    "src",
+]
+
+# Do not turn third-party stub gaps into repo-wide noise.
+reportMissingTypeStubs = "none"
+
+# --- Explicit typing pressure ---
+
+reportMissingParameterType = "error"
+reportMissingTypeArgument = "error"
+
+reportUnknownArgumentType = "error"
+reportUnknownLambdaType = "error"
+reportUnknownMemberType = "error"
+reportUnknownParameterType = "error"
+reportUnknownVariableType = "error"
+
+reportUntypedFunctionDecorator = "error"
+reportUntypedClassDecorator = "error"
+reportUntypedBaseClass = "error"
+
+# --- Dead code / fake fixes / AI slop ---
+
+reportUnusedImport = "error"
+reportUnusedVariable = "error"
+reportUnusedFunction = "warning"
+reportUnusedClass = "warning"
+reportDuplicateImport = "error"
+
+reportUnnecessaryCast = "error"
+reportUnnecessaryTypeIgnoreComment = "error"
+reportUnreachable = "error"
+
+# Kept at warning: fires on intentionally-discarded return values from
+# void-ish methods (list.append, set.add, etc.). Still catches the real
+# problem (AI ignoring meaningful return values) without generating a
+# flood of suppression comments on perfectly correct call sites.
+
+reportUnusedCallResult = "warning"
+reportDeprecated = "warning"
+
+# --- Structural and correctness pressure ---
+
+reportMatchNotExhaustive = "error"
+reportImportCycles = "error"
+reportImplicitOverride = "error"
+reportPropertyTypeMismatch = "error"
+reportUninitializedInstanceVariable = "error"
+reportCallInDefaultInitializer = "error"
+
+# --- Override correctness ---
+
+reportIncompatibleMethodOverride = "error"
+
+# --- Optional safety ---
+
+reportOptionalMemberAccess = "error"
+reportOptionalSubscript = "error"
+reportOptionalCall = "error"
+reportOptionalIterable = "error"
+
+# --- Import correctness ---
+
+reportPrivateImportUsage = "error"
+
+# Tests stay lighter: real type checking remains on, but Unknown
+# diagnostics from fixtures, mocks, and pytest-heavy patterns are
+# relaxed to warnings so the model is nudged rather than blocked.
+# (Array-of-tables syntax: TOML 1.0 does not allow multi-line inline
+# tables, and these entries must stay after all other tool.pyright keys.)
+[[tool.pyright.executionEnvironments]]
+root = "tests"
+extraPaths = ["./src"]
+reportPrivateUsage = "none"
+reportMissingParameterType = "warning"
+reportUnknownArgumentType = "warning"
+reportUnknownLambdaType = "none"
+reportUnknownMemberType = "none"
+reportUnknownParameterType = "warning"
+reportUnknownVariableType = "warning"
+
+# Main repo environment (must come after more-specific roots)
+[[tool.pyright.executionEnvironments]]
+root = "."
+extraPaths = ["./src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = [
+    "--import-mode=importlib",
+    "--cov=weather_agent",
+    "--cov-branch",
+    "--cov-report=term-missing",
+]

@@ -1,0 +1,78 @@
+"""Assemble the open-meteo weather agent."""
+
+from strands import Agent
+from strands.models.ollama import OllamaModel
+
+from weather_agent.tools import (
+    assess_drone_conditions,
+    compare_weather,
+    get_air_quality,
+    get_climate_projection,
+    get_current_weather,
+    get_elevation,
+    get_ensemble_forecast,
+    get_forecast,
+    get_historical_weather,
+    get_marine_forecast,
+    get_river_discharge,
+    get_weather,
+    list_supported_drones,
+)
+
+_SYSTEM_PROMPT = (
+    "You are a weather assistant for open-meteo data. Always name the location you "
+    "report on. Choose the tool that matches the question. For temperature and "
+    "precipitation over time: get_current_weather (now), get_forecast (coming days), "
+    "get_historical_weather (past dates, ERA5 from 1940), get_climate_projection "
+    "(decade-scale future, CMIP6, to 2050). When the user names a single date and you "
+    "are unsure which of those fits, use get_weather, which routes by date. Use "
+    "compare_weather to compare two historical date ranges. For other domains: "
+    "get_air_quality (pollution and AQI), get_marine_forecast (waves, coastal "
+    "points), get_river_discharge (flood indicator), get_ensemble_forecast (forecast "
+    "uncertainty), and get_elevation (terrain height). For drone flying (DJI Neo, "
+    "Avata 2, Mini 5 Pro) use assess_drone_conditions, and list_supported_drones to "
+    "see which models are covered; always pass on its UK CAA notes and safety "
+    "disclaimer, and never present it as legal or airworthiness authority. Date-based "
+    "tools take ISO start and end dates (YYYY-MM-DD)."
+)
+_DEFAULT_OLLAMA_HOST = "http://localhost:11434"
+_DEFAULT_MODEL_ID = "gemma4:12b"
+
+
+def build_agent(
+    host: str = _DEFAULT_OLLAMA_HOST,
+    model_id: str = _DEFAULT_MODEL_ID,
+) -> Agent:
+    """Build a Strands agent wired with the open-meteo weather tool.
+
+    The agent runs against a local Ollama server. Pull the model first with
+    ``ollama pull <model_id>`` and ensure ``ollama serve`` is reachable at
+    ``host``. The open-meteo tool itself needs no credentials.
+
+    Args:
+        host: Base URL of the Ollama server.
+        model_id: Ollama model tag to use, for example ``"gemma4:12b"``.
+
+    Returns:
+        A configured agent ready to answer current-weather questions.
+    """
+    model = OllamaModel(host=host, model_id=model_id)
+    return Agent(
+        model=model,
+        system_prompt=_SYSTEM_PROMPT,
+        tools=[
+            get_current_weather,
+            get_forecast,
+            get_historical_weather,
+            get_climate_projection,
+            get_weather,
+            compare_weather,
+            get_air_quality,
+            get_marine_forecast,
+            get_river_discharge,
+            get_ensemble_forecast,
+            get_elevation,
+            assess_drone_conditions,
+            list_supported_drones,
+        ],
+    )

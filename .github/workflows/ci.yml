@@ -1,0 +1,33 @@
+name: CI
+
+on:
+    push:
+        branches: [main]
+    pull_request:
+
+jobs:
+    quality:
+        runs-on: ubuntu-latest
+        steps:
+            - uses: actions/checkout@v6
+
+            # setup-uv v8+ publishes no moving major tag; pin the exact
+            # release. The deployed Dependabot config keeps it current.
+            - uses: astral-sh/setup-uv@v8.2.0
+              with:
+                  enable-cache: true
+
+            - name: Sync environment
+              run: uv sync --locked
+
+            - name: Lint
+              run: uv run ruff check .
+
+            - name: Format check
+              run: uv run ruff format --check .
+
+            - name: Type check
+              run: uv run pyright
+
+            - name: Test
+              run: uv run pytest
