@@ -27,13 +27,18 @@ from weather_agent.models import ClimateRequest, HistoricalRequest
 from weather_agent.parsing import OpenMeteoError, SpaceWeatherError
 from weather_agent.reporting import (
     DAILY_VARIABLES,
+    FORECAST_DAILY_VARIABLES,
+    SOLAR_DAILY_VARIABLES,
     describe_comparison,
     describe_current_readings,
+    describe_current_weather,
     describe_daily_forecast,
     describe_ensemble_spread,
     describe_forecast_day,
     describe_latest_values,
     describe_period,
+    describe_solar,
+    describe_uv,
 )
 from weather_agent.results import Answer, Failed, Invalid, LookupOutcome, NotFound
 from weather_agent.routing import FORECAST_HORIZON_DAYS, DataSource, select_data_source
@@ -51,6 +56,16 @@ _MARINE_VARIABLES = ("wave_height", "wave_period")
 _MARINE_REQUEST = ",".join(_MARINE_VARIABLES)
 _RIVER_DISCHARGE_VARIABLES = ("river_discharge",)
 _RIVER_DISCHARGE_REQUEST = ",".join(_RIVER_DISCHARGE_VARIABLES)
+_POLLEN_VARIABLES = (
+    "alder_pollen",
+    "birch_pollen",
+    "grass_pollen",
+    "mugwort_pollen",
+    "olive_pollen",
+    "ragweed_pollen",
+)
+_POLLEN_REQUEST = ",".join(_POLLEN_VARIABLES)
+_SOLAR_FORECAST_DAYS = 3
 _ENSEMBLE_VARIABLE = "temperature_2m"
 _HTTP_BAD_REQUEST = 400
 _ROUTED_CLIMATE_CAVEAT = (
@@ -116,11 +131,7 @@ def current_weather_summary(location: str, client: OpenMeteoClient | None = None
 
     def describe(active: OpenMeteoClient, place: GeocodeResult) -> str:
         weather = active.current_weather(place.latitude, place.longitude)
-        return (
-            f"Current weather in {_place_label(place)}: "
-            f"{weather.temperature_celsius} °C, "
-            f"wind {weather.wind_speed_kmh} km/h (as of {weather.time})."
-        )
+        return describe_current_weather(_place_label(place), weather)
 
     return _summarize(location, client, describe)
 
@@ -146,7 +157,9 @@ def forecast_summary(
         return Invalid(f"Forecast days must be between 1 and {FORECAST_HORIZON_DAYS} (got {days}).")
 
     def describe(active: OpenMeteoClient, place: GeocodeResult) -> str:
-        series = active.forecast_series(place.latitude, place.longitude, DAILY_VARIABLES, days)
+        series = active.forecast_series(
+            place.latitude, place.longitude, FORECAST_DAILY_VARIABLES, days
+        )
         return describe_daily_forecast(_place_label(place), series, days)
 
     return _summarize(location, client, describe)
@@ -176,7 +189,9 @@ def forecast_for_day(
     """
 
     def describe(active: OpenMeteoClient, place: GeocodeResult) -> str:
-        series = active.forecast_day_series(place.latitude, place.longitude, DAILY_VARIABLES, when)
+        series = active.forecast_day_series(
+            place.latitude, place.longitude, FORECAST_DAILY_VARIABLES, when
+        )
         return describe_forecast_day(_place_label(place), series, 0, heading)
 
     return _summarize(location, client, describe)
@@ -359,6 +374,110 @@ def elevation_summary(location: str, client: OpenMeteoClient | None = None) -> L
         return f"Elevation of {_place_label(place)}: {elevation.meters:.0f} m above sea level."
 
     return _summarize(location, client, describe)
+
+
+def uv_index_summary(location: str, client: OpenMeteoClient | None = None) -> LookupOutcome:
+    """Build a UV-index summary (now and today's peak) for a named location.
+
+    Args:
+        location: A city or place name.
+        client: Optional client to use.
+
+    Returns:
+        An outcome wrapping the current UV index and today's maximum with risk
+        bands.
+    """
+
+    def describe(active: OpenMeteoClient, place: GeocodeResult) -> str:
+        uv = active.uv_index(place.latitude, place.longitude)
+        return describe_uv(_place_label(place), uv)
+
+    return _summarize(location, client, describe)
+
+
+def pollen_summary(location: str, client: OpenMeteoClient | None = None) -> LookupOutcome:
+    """Build a pollen summary for a named location.
+
+    Pollen comes from the CAMS European air-quality model, so values are reported
+    for European locations; elsewhere the API returns no data and the figures show
+    as ``n/a``.
+
+    Args:
+        location: A city or place name.
+        client: Optional client to use.
+
+    Returns:
+        An outcome wrapping current pollen levels for the major allergenic taxa.
+    """
+
+    def describe(active: OpenMeteoClient, place: GeocodeResult) -> str:
+        readings = active.air_quality_current(place.latitude, place.longitude, _POLLEN_REQUEST)
+        return describe_current_readings(_place_label(place), readings, "Pollen", _POLLEN_VARIABLES)
+
+    return _summarize(location, client, describe)
+
+
+def solar_summary(
+    location: str,
+    days: int = _SOLAR_FORECAST_DAYS,
+    client: OpenMeteoClient | None = None,
+) -> LookupOutcome:
+    """Build a daily solar-potential summary for a named location.
+
+    Args:
+        location: A city or place name.
+        days: Number of forecast days to report (1 to the forecast horizon).
+        client: Optional client to use.
+
+    Returns:
+        An outcome wrapping daily radiation, sunshine, and daylight, or an
+        invalid-input outcome when ``days`` is out of range.
+    """
+    if not 1 <= days <= FORECAST_HORIZON_DAYS:
+        return Invalid(f"Forecast days must be between 1 and {FORECAST_HORIZON_DAYS} (got {days}).")
+
+    def describe(active: OpenMeteoClient, place: GeocodeResult) -> str:
+        series = active.forecast_series(
+            place.latitude, place.longitude, SOLAR_DAILY_VARIABLES, days
+        )
+        return describe_solar(_place_label(place), series, days)
+
+    return _summarize(location, client, describe)
+
+
+def _coordinate_label(latitude: float, longitude: float) -> str:
+    return f"{latitude:.4f}, {longitude:.4f}"
+
+
+def current_weather_at_coordinates(
+    latitude: float,
+    longitude: float,
+    client: OpenMeteoClient | None = None,
+) -> LookupOutcome:
+    """Build a current-weather summary for explicit coordinates (no geocoding).
+
+    Bypasses name resolution so a raw latitude/longitude can be queried directly,
+    labelling the result with the coordinates.
+
+    Args:
+        latitude: Latitude in decimal degrees.
+        longitude: Longitude in decimal degrees.
+        client: Optional client to use.
+
+    Returns:
+        An outcome wrapping the current conditions at the coordinates.
+    """
+    owns_client = client is None
+    active = client if client is not None else OpenMeteoClient()
+    label = _coordinate_label(latitude, longitude)
+    try:
+        weather = active.current_weather(latitude, longitude)
+        return Answer(describe_current_weather(label, weather))
+    except (httpx.HTTPError, OpenMeteoError) as error:
+        return Failed(label, str(error))
+    finally:
+        if owns_client:
+            active.close()
 
 
 def weather_for_date(

@@ -11,6 +11,7 @@ from weather_agent.weather import (
     air_quality_summary,
     climate_summary,
     compare_periods,
+    current_weather_at_coordinates,
     current_weather_summary,
     drone_flight_summary,
     elevation_summary,
@@ -18,7 +19,10 @@ from weather_agent.weather import (
     forecast_summary,
     historical_summary,
     marine_summary,
+    pollen_summary,
     river_discharge_summary,
+    solar_summary,
+    uv_index_summary,
     weather_for_date,
 )
 
@@ -157,6 +161,69 @@ def get_elevation(location: str) -> str:
         message when the location cannot be resolved.
     """
     return render(elevation_summary(location))
+
+
+@tool
+def get_uv_index(location: str) -> str:
+    """Get the current UV index and today's peak for a named location.
+
+    Args:
+        location: A city or place name, for example "Nairobi" or "Sydney".
+
+    Returns:
+        A summary of the UV index now and today's maximum with WHO risk bands, or
+        an explanatory message when the location cannot be resolved.
+    """
+    return render(uv_index_summary(location))
+
+
+@tool
+def get_pollen(location: str) -> str:
+    """Get current pollen levels for a named location (Europe).
+
+    Pollen is sourced from the European CAMS model, so coverage is European;
+    elsewhere values report as not available.
+
+    Args:
+        location: A city or place name, for example "Paris" or "Berlin".
+
+    Returns:
+        A summary of grass, tree, and weed pollen levels, or an explanatory
+        message when the location cannot be resolved.
+    """
+    return render(pollen_summary(location))
+
+
+@tool
+def get_solar_potential(location: str, days: int = 3) -> str:
+    """Get a daily solar-energy potential outlook for a named location.
+
+    Args:
+        location: A city or place name, for example "Madrid" or "Reykjavik".
+        days: Number of forecast days to report (1-16).
+
+    Returns:
+        A multi-day summary of solar radiation, sunshine, and daylight hours, or an
+        explanatory message when the location cannot be resolved.
+    """
+    return render(solar_summary(location, days))
+
+
+@tool
+def get_weather_at_coordinates(latitude: float, longitude: float) -> str:
+    """Get the current weather at explicit coordinates, skipping name lookup.
+
+    Use this when the user gives a latitude and longitude rather than a place name.
+
+    Args:
+        latitude: Latitude in decimal degrees (-90 to 90).
+        longitude: Longitude in decimal degrees (-180 to 180).
+
+    Returns:
+        A summary of current conditions at the coordinates, or an explanatory
+        message when the lookup fails.
+    """
+    return render(current_weather_at_coordinates(latitude, longitude))
 
 
 @tool

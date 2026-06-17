@@ -14,8 +14,12 @@ from weather_agent.tools import (
     get_forecast,
     get_historical_weather,
     get_marine_forecast,
+    get_pollen,
     get_river_discharge,
+    get_solar_potential,
+    get_uv_index,
     get_weather,
+    get_weather_at_coordinates,
     list_supported_drones,
 )
 
@@ -27,9 +31,12 @@ _SYSTEM_PROMPT = (
     "(decade-scale future, CMIP6, to 2050). When the user names a single date and you "
     "are unsure which of those fits, use get_weather, which routes by date. Use "
     "compare_weather to compare two historical date ranges. For other domains: "
-    "get_air_quality (pollution and AQI), get_marine_forecast (waves, coastal "
-    "points), get_river_discharge (flood indicator), get_ensemble_forecast (forecast "
-    "uncertainty), and get_elevation (terrain height). For drone flying (DJI Neo, "
+    "get_air_quality (pollution and AQI), get_pollen (allergens, Europe), "
+    "get_marine_forecast (waves, coastal points), get_river_discharge (flood "
+    "indicator), get_ensemble_forecast (forecast uncertainty), get_uv_index (sun "
+    "safety), get_solar_potential (solar energy outlook), and get_elevation (terrain "
+    "height). When the user gives a latitude and longitude instead of a place name, "
+    "use get_weather_at_coordinates. For drone flying (DJI Neo, "
     "Avata 2, Mini 5 Pro) use assess_drone_conditions, and list_supported_drones to "
     "see which models are covered; always pass on its UK CAA notes and safety "
     "disclaimer, and never present it as legal or airworthiness authority. Date-based "
@@ -68,10 +75,14 @@ def build_agent(
             get_weather,
             compare_weather,
             get_air_quality,
+            get_pollen,
             get_marine_forecast,
             get_river_discharge,
             get_ensemble_forecast,
+            get_uv_index,
+            get_solar_potential,
             get_elevation,
+            get_weather_at_coordinates,
             assess_drone_conditions,
             list_supported_drones,
         ],

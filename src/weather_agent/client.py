@@ -18,6 +18,7 @@ from weather_agent.parsing import (
     parse_geocode_results,
     parse_kp,
     parse_time_series,
+    parse_uv_index,
 )
 
 if TYPE_CHECKING:
@@ -33,6 +34,7 @@ if TYPE_CHECKING:
         HistoricalRequest,
         KpIndex,
         TimeSeries,
+        UvIndex,
     )
 
 _GEOCODING_URL = "https://geocoding-api.open-meteo.com/v1/search"
@@ -47,6 +49,10 @@ _ELEVATION_URL = "https://api.open-meteo.com/v1/elevation"
 _PLANETARY_KP_URL = "https://services.swpc.noaa.gov/products/noaa-planetary-k-index.json"
 _DEFAULT_TIMEOUT = 10.0
 _DEFAULT_TIMEZONE = "Europe/London"
+_CURRENT_WEATHER_REQUEST = (
+    "temperature_2m,wind_speed_10m,weather_code,"
+    "relative_humidity_2m,dew_point_2m,surface_pressure,cloud_cover"
+)
 
 
 class OpenMeteoClient:
@@ -135,10 +141,40 @@ class OpenMeteoClient:
             {
                 "latitude": latitude,
                 "longitude": longitude,
-                "current": "temperature_2m,wind_speed_10m",
+                "current": _CURRENT_WEATHER_REQUEST,
             },
         )
         return parse_current_weather(payload)
+
+    def uv_index(self, latitude: float, longitude: float) -> UvIndex:
+        """Fetch the current UV index and today's maximum for a coordinate.
+
+        Uses ``timezone=auto`` so "today" and its peak are aligned to the
+        location's local day rather than UTC.
+
+        Args:
+            latitude: Latitude in decimal degrees.
+            longitude: Longitude in decimal degrees.
+
+        Returns:
+            The current UV index and today's forecast maximum.
+
+        Raises:
+            httpx.HTTPError: If the request fails or returns an error status.
+            OpenMeteoError: If the response shape is unexpected.
+        """
+        payload = self._get_json(
+            _FORECAST_URL,
+            {
+                "latitude": latitude,
+                "longitude": longitude,
+                "current": "uv_index",
+                "daily": "uv_index_max",
+                "forecast_days": 1,
+                "timezone": "auto",
+            },
+        )
+        return parse_uv_index(payload)
 
     def drone_forecast(
         self,

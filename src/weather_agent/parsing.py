@@ -16,6 +16,7 @@ from weather_agent.models import (
     GeocodeResult,
     KpIndex,
     TimeSeries,
+    UvIndex,
 )
 
 # Non-variable keys open-meteo includes in a ``current`` block.
@@ -154,6 +155,42 @@ def parse_current_weather(payload: object) -> CurrentWeather:
         time=_require_str(current, "time"),
         temperature_celsius=_require_float(current, "temperature_2m"),
         wind_speed_kmh=_require_float(current, "wind_speed_10m"),
+        weather_code=_coerce_float_or_none(current.get("weather_code"), "weather_code"),
+        relative_humidity_pct=_coerce_float_or_none(
+            current.get("relative_humidity_2m"), "relative_humidity_2m"
+        ),
+        dew_point_celsius=_coerce_float_or_none(current.get("dew_point_2m"), "dew_point_2m"),
+        surface_pressure_hpa=_coerce_float_or_none(
+            current.get("surface_pressure"), "surface_pressure"
+        ),
+        cloud_cover_pct=_coerce_float_or_none(current.get("cloud_cover"), "cloud_cover"),
+    )
+
+
+def parse_uv_index(payload: object) -> UvIndex:
+    """Parse a forecast payload requested for UV (current value + daily maximum).
+
+    Expects ``current=uv_index`` and ``daily=uv_index_max``; reads the present
+    value from the ``current`` block and today's peak from the first ``daily`` row.
+
+    Args:
+        payload: Decoded JSON from the forecast endpoint.
+
+    Returns:
+        The current UV index and today's maximum (each ``None`` when absent).
+
+    Raises:
+        OpenMeteoError: If the payload or its ``current`` block is missing or has
+            an unexpected shape, or the current ``time`` is absent or non-string.
+    """
+    body = _require_mapping(payload, "uv response")
+    current = _require_mapping(body.get("current"), "current uv block")
+    daily = parse_time_series(payload, "daily")
+    maxima = daily.series.get("uv_index_max", ())
+    return UvIndex(
+        time=_require_str(current, "time"),
+        current=_coerce_float_or_none(current.get("uv_index"), "uv_index"),
+        today_max=maxima[0] if maxima else None,
     )
 
 

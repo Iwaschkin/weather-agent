@@ -54,7 +54,10 @@ def test_current_weather_parses_response() -> None:
     """current_weather() resolves a coordinate into typed conditions."""
 
     def handler(request: httpx.Request) -> httpx.Response:
-        assert request.url.params["current"] == "temperature_2m,wind_speed_10m"
+        current = request.url.params["current"]
+        assert "temperature_2m" in current
+        assert "wind_speed_10m" in current
+        assert "weather_code" in current
         return httpx.Response(200, json=_FORECAST_BODY)
 
     client = _client_with(handler)

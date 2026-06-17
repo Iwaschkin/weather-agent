@@ -1,14 +1,19 @@
 """Tests for the pure time-series reporting helpers."""
 
-from weather_agent.models import CurrentReadings, TimeSeries
+import pytest
+
+from weather_agent.models import CurrentReadings, CurrentWeather, TimeSeries, UvIndex
 from weather_agent.reporting import (
     describe_comparison,
     describe_current_readings,
+    describe_current_weather,
     describe_daily_forecast,
     describe_ensemble_spread,
     describe_forecast_day,
     describe_latest_values,
     describe_period,
+    describe_solar,
+    describe_uv,
 )
 
 
@@ -153,6 +158,81 @@ def test_describe_comparison_reports_delta() -> None:
 
     assert "summer 30.0 °C vs winter 5.0 °C" in summary
     assert "delta -25.0 °C" in summary
+
+
+def test_describe_current_weather_names_condition_and_extras() -> None:
+    """Current weather names the WMO condition and appends present optional fields."""
+    weather = CurrentWeather(
+        time="2026-06-15T12:00",
+        temperature_celsius=21.3,
+        wind_speed_kmh=9.7,
+        weather_code=61.0,
+        relative_humidity_pct=65.0,
+        dew_point_celsius=14.2,
+        surface_pressure_hpa=1013.0,
+        cloud_cover_pct=90.0,
+    )
+
+    summary = describe_current_weather("Berlin", weather)
+
+    assert "Current weather in Berlin: slight rain, 21.3 °C, wind 9.7 km/h" in summary
+    assert "humidity 65%" in summary
+    assert "cloud 90%" in summary
+
+
+def test_describe_current_weather_omits_absent_optionals() -> None:
+    """Optional fields that are None are left out of the line."""
+    weather = CurrentWeather(
+        time="2026-06-15T12:00",
+        temperature_celsius=21.3,
+        wind_speed_kmh=9.7,
+        weather_code=None,
+        relative_humidity_pct=None,
+        dew_point_celsius=None,
+        surface_pressure_hpa=None,
+        cloud_cover_pct=None,
+    )
+
+    summary = describe_current_weather("Berlin", weather)
+
+    assert "unknown, 21.3 °C, wind 9.7 km/h" in summary
+    assert "humidity" not in summary
+
+
+@pytest.mark.parametrize(
+    ("value", "band"),
+    [(1.0, "low"), (4.0, "moderate"), (7.0, "high"), (9.0, "very high"), (11.5, "extreme")],
+)
+def test_describe_uv_bands(value: float, band: str) -> None:
+    """The UV index maps to the right WHO risk band."""
+    uv = UvIndex(time="2026-06-15T12:00", current=value, today_max=value)
+
+    assert band in describe_uv("Nairobi", uv)
+
+
+def test_describe_uv_handles_no_data() -> None:
+    """All-None UV yields an explanatory note."""
+    uv = UvIndex(time="t", current=None, today_max=None)
+
+    assert "No UV data" in describe_uv("Nairobi", uv)
+
+
+def test_describe_solar_reports_radiation_and_hours() -> None:
+    """Solar potential reports radiation in MJ/m² and durations in hours."""
+    series = TimeSeries(
+        timestamps=("2026-06-15",),
+        series={
+            "shortwave_radiation_sum": (28.0,),
+            "sunshine_duration": (36000.0,),
+            "daylight_duration": (57600.0,),
+        },
+    )
+
+    summary = describe_solar("Madrid", series, max_days=1)
+
+    assert "radiation 28.0 MJ/m²" in summary
+    assert "sunshine 10.0 h" in summary
+    assert "daylight 16.0 h" in summary
 
 
 def test_describe_comparison_omits_delta_when_data_missing() -> None:

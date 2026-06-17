@@ -9,6 +9,7 @@ from weather_agent.parsing import (
     parse_elevation,
     parse_geocode_results,
     parse_time_series,
+    parse_uv_index,
 )
 
 
@@ -130,6 +131,64 @@ def test_parse_current_weather_rejects_malformed(payload: object) -> None:
     """Malformed forecast payloads raise a domain error."""
     with pytest.raises(OpenMeteoError):
         _ = parse_current_weather(payload)
+
+
+def test_parse_current_weather_reads_optional_fields() -> None:
+    """Condition code and the richer optional fields are parsed when present."""
+    payload: dict[str, object] = {
+        "current": {
+            "time": "2026-06-15T12:00",
+            "temperature_2m": 21.3,
+            "wind_speed_10m": 9.7,
+            "weather_code": 61,
+            "relative_humidity_2m": 65,
+            "dew_point_2m": 14.2,
+            "surface_pressure": 1013.0,
+            "cloud_cover": 90,
+        },
+    }
+
+    weather = parse_current_weather(payload)
+
+    assert weather.weather_code == 61.0
+    assert weather.relative_humidity_pct == 65.0
+    assert weather.cloud_cover_pct == 90.0
+
+
+def test_parse_current_weather_optional_fields_default_none() -> None:
+    """Absent optional fields are None, not errors."""
+    payload: dict[str, object] = {
+        "current": {"time": "t", "temperature_2m": 1.0, "wind_speed_10m": 2.0},
+    }
+
+    weather = parse_current_weather(payload)
+
+    assert weather.weather_code is None
+    assert weather.surface_pressure_hpa is None
+
+
+def test_parse_uv_index_reads_current_and_today_max() -> None:
+    """UV parsing reads the current value and today's daily maximum."""
+    payload: dict[str, object] = {
+        "current": {"time": "2026-06-15T12:00", "uv_index": 4.2},
+        "daily": {"time": ["2026-06-15"], "uv_index_max": [7.8]},
+    }
+
+    uv = parse_uv_index(payload)
+
+    assert uv.time == "2026-06-15T12:00"
+    assert uv.current == 4.2
+    assert uv.today_max == 7.8
+
+
+def test_parse_uv_index_missing_daily_max_is_none() -> None:
+    """An empty daily block leaves today's max as None."""
+    payload: dict[str, object] = {
+        "current": {"time": "t", "uv_index": 1.0},
+        "daily": {"time": []},
+    }
+
+    assert parse_uv_index(payload).today_max is None
 
 
 def test_parse_current_readings_extracts_present_hour() -> None:

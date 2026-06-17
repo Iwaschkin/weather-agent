@@ -41,15 +41,30 @@ class GeocodeResult:
 class CurrentWeather:
     """Current weather conditions reported for a coordinate.
 
+    Temperature and wind are always present; the remaining fields are reported
+    only when requested and available, so they are optional and ``None`` when the
+    API omits them.
+
     Attributes:
         time: ISO-8601 timestamp of the observation, as returned by the API.
         temperature_celsius: Air temperature 2 m above ground, in degrees Celsius.
         wind_speed_kmh: Wind speed 10 m above ground, in kilometres per hour.
+        weather_code: WMO weather-interpretation code for the condition (for
+            example clear, rain, snow), or ``None`` when unavailable.
+        relative_humidity_pct: Relative humidity 2 m above ground, in percent.
+        dew_point_celsius: Dew point 2 m above ground, in degrees Celsius.
+        surface_pressure_hpa: Surface air pressure, in hectopascals.
+        cloud_cover_pct: Total cloud cover, in percent.
     """
 
     time: str
     temperature_celsius: float
     wind_speed_kmh: float
+    weather_code: float | None
+    relative_humidity_pct: float | None
+    dew_point_celsius: float | None
+    surface_pressure_hpa: float | None
+    cloud_cover_pct: float | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -103,6 +118,22 @@ class CurrentReadings:
 
     time: str
     values: Mapping[str, float | None]
+
+
+@dataclass(frozen=True, slots=True)
+class UvIndex:
+    """Ultraviolet index for a coordinate: the value now and today's peak.
+
+    Attributes:
+        time: ISO-8601 timestamp of the current reading, as returned by the API.
+        current: The UV index right now, or ``None`` when unavailable.
+        today_max: The maximum UV index forecast for today, or ``None`` when
+            unavailable. Used to warn about peak exposure even when it is mild now.
+    """
+
+    time: str
+    current: float | None
+    today_max: float | None
 
 
 @dataclass(frozen=True, slots=True)

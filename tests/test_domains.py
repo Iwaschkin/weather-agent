@@ -6,10 +6,14 @@ from weather_agent.client import OpenMeteoClient
 from weather_agent.results import render
 from weather_agent.weather import (
     air_quality_summary,
+    current_weather_at_coordinates,
     elevation_summary,
     ensemble_summary,
     marine_summary,
+    pollen_summary,
     river_discharge_summary,
+    solar_summary,
+    uv_index_summary,
 )
 
 _GEOCODE_BODY: dict[str, object] = {
@@ -46,6 +50,38 @@ _ENSEMBLE_BODY: dict[str, object] = {
     },
 }
 _ELEVATION_BODY: dict[str, object] = {"elevation": [38.0]}
+_UV_BODY: dict[str, object] = {
+    "current": {"time": "2026-06-15T12:00", "uv_index": 4.2},
+    "daily": {"time": ["2026-06-15"], "uv_index_max": [8.1]},
+}
+_POLLEN_BODY: dict[str, object] = {
+    "current": {
+        "time": "2026-06-15T13:00",
+        "interval": 3600,
+        "alder_pollen": None,
+        "birch_pollen": 0.0,
+        "grass_pollen": 45.0,
+        "mugwort_pollen": 5.0,
+        "olive_pollen": 0.0,
+        "ragweed_pollen": 0.0,
+    },
+}
+_SOLAR_BODY: dict[str, object] = {
+    "daily": {
+        "time": ["2026-06-15"],
+        "shortwave_radiation_sum": [28.0],
+        "sunshine_duration": [36000.0],
+        "daylight_duration": [57600.0],
+    },
+}
+_CURRENT_BODY: dict[str, object] = {
+    "current": {
+        "time": "2026-06-15T12:00",
+        "temperature_2m": 21.3,
+        "wind_speed_10m": 9.7,
+        "weather_code": 3,
+    },
+}
 
 
 def _client_for(host_prefix: str, body: object) -> OpenMeteoClient:
@@ -133,3 +169,64 @@ def test_elevation_summary_reports_metres() -> None:
     )
 
     assert "Elevation of Berlin, Germany: 38 m above sea level." in summary
+
+
+def test_uv_index_summary_reports_now_and_peak() -> None:
+    """UV summary reports the current value and today's peak with bands."""
+    summary = render(uv_index_summary("Sydney", client=_client_for("api.open-meteo", _UV_BODY)))
+
+    assert "UV index for Berlin, Germany" in summary
+    assert "now 4.2 (moderate)" in summary
+    assert "today's max 8.1 (very high)" in summary
+
+
+def test_pollen_summary_reports_levels() -> None:
+    """Pollen summary reports allergen levels from the current block."""
+    summary = render(pollen_summary("Paris", client=_client_for("air-quality", _POLLEN_BODY)))
+
+    assert "Pollen for Berlin, Germany" in summary
+    assert "grass_pollen 45.0" in summary
+    assert "alder_pollen n/a" in summary
+
+
+def test_solar_summary_reports_radiation_and_hours() -> None:
+    """Solar summary reports radiation and durations for the requested days."""
+    summary = render(
+        solar_summary("Madrid", days=1, client=_client_for("api.open-meteo", _SOLAR_BODY))
+    )
+
+    assert "Solar potential for Berlin, Germany" in summary
+    assert "radiation 28.0 MJ/m²" in summary
+    assert "sunshine 10.0 h" in summary
+
+
+def test_solar_summary_rejects_out_of_range_days() -> None:
+    """Out-of-range day counts are rejected before any network call."""
+    summary = render(
+        solar_summary("Madrid", days=0, client=_client_for("api.open-meteo", _SOLAR_BODY))
+    )
+
+    assert "Forecast days must be between 1 and 16" in summary
+
+
+def test_current_weather_at_coordinates_labels_with_coordinates() -> None:
+    """Coordinate input skips geocoding and labels with the coordinates."""
+    client = _client_for("api.open-meteo", _CURRENT_BODY)
+
+    summary = render(current_weather_at_coordinates(52.52, 13.41, client=client))
+
+    assert "Current weather in 52.5200, 13.4100" in summary
+    assert "overcast" in summary
+
+
+def test_current_weather_at_coordinates_reports_failure() -> None:
+    """A transport failure for coordinates yields a failure message naming them."""
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(503)
+
+    client = OpenMeteoClient(client=httpx.Client(transport=httpx.MockTransport(handler)))
+
+    summary = render(current_weather_at_coordinates(52.52, 13.41, client=client))
+
+    assert "Could not retrieve data for '52.5200, 13.4100'" in summary
