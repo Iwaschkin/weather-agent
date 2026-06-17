@@ -391,6 +391,45 @@ class Verdict(Enum):
 
 
 @dataclass(frozen=True, slots=True)
+class GateReading:
+    """One weather gate's structured judgment for an hour.
+
+    Carries the raw value alongside the threshold it was judged against and the
+    precomputed ``ratio`` (value / threshold), so a model can read the judgment
+    rather than do the comparison itself. ``reason`` is the human string (the
+    small-model fallback and the rendered explanation); fields are ``None`` where
+    they do not apply (for example a boolean night check has no numeric value).
+
+    Attributes:
+        metric: Short metric key, for example ``"wind_gust"`` or ``"cape"``.
+        band: This gate's verdict.
+        reason: Human-readable explanation; empty when the gate is ``GOOD``.
+        value: The metric's value for the hour, or ``None`` when unavailable.
+        unit: The value's unit (for example ``"m/s"``, ``"%"``), or empty.
+        threshold: The limit the value was judged against, or ``None``.
+        limiting: Whether this gate set (tied for) the hour's overall verdict.
+        ratio: ``value / threshold`` when both are present and the threshold is
+            non-zero, else ``None`` (a computed property, so the model never
+            divides itself).
+    """
+
+    metric: str
+    band: Verdict
+    reason: str = ""
+    value: float | None = None
+    unit: str = ""
+    threshold: float | None = None
+    limiting: bool = False
+
+    @property
+    def ratio(self) -> float | None:
+        """``value / threshold`` when both are present and the threshold is non-zero."""
+        if self.value is None or self.threshold is None or self.threshold == 0:
+            return None
+        return self.value / self.threshold
+
+
+@dataclass(frozen=True, slots=True)
 class HourAssessment:
     """The flyability verdict for one forecast hour and one drone.
 
@@ -401,12 +440,16 @@ class HourAssessment:
             the verdict is :attr:`Verdict.GOOD`.
         governing_wind_ms: The worst-case wind used for the wind gate, in metres
             per second, or ``None`` when wind data was unavailable.
+        readings: Every gate's structured judgment for the hour, in evaluation
+            order (raw value, threshold, ratio, band), for explanation and edge
+            reasoning beyond the flat ``limiting_factors`` strings.
     """
 
     time: str
     verdict: Verdict
     limiting_factors: tuple[str, ...]
     governing_wind_ms: float | None
+    readings: tuple[GateReading, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)

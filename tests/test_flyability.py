@@ -201,6 +201,26 @@ def test_assess_hour_marginal_when_wind_unavailable() -> None:
     assert result.governing_wind_ms is None
 
 
+def test_assess_hour_exposes_structured_readings() -> None:
+    """Each hour carries structured gate readings with precomputed ratio and band."""
+    gusty = replace(_GOOD_HOUR, wind_gust_10m_kmh=60.0, wind_max_0_500m_kmh=60.0)  # ~16.7 m/s
+    result = assess_hour(MINI_5_PRO, gusty)
+
+    wind = next(reading for reading in result.readings if reading.metric == "wind_gust")
+    assert wind.band is Verdict.NO_FLY
+    assert wind.value is not None
+    assert wind.threshold == 12.0
+    assert wind.ratio is not None  # precomputed value / threshold
+    assert wind.ratio > 1.0
+    assert wind.limiting is True
+    assert "1.4x" in wind.reason  # absolute + relative + reference framing
+
+    # A passing gate is present but not limiting, and a boolean/empty gate has no ratio.
+    temperature = next(reading for reading in result.readings if reading.metric == "temperature")
+    assert temperature.band is Verdict.GOOD
+    assert temperature.limiting is False
+
+
 def test_best_window_finds_longest_good_run() -> None:
     """The best window is the longest contiguous run of good hours."""
     hours = (

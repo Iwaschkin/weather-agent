@@ -1,17 +1,27 @@
 """Pure flyability rules engine turning forecast hours into drone verdicts.
 
-Each weather factor is a small "gate" returning a verdict and a short reason.
-The worst gate decides the hour's overall verdict, and its reasons become the
-limiting factors. All functions are pure and unit-testable without network
-access. Thresholds are deliberately conservative and named for tuning.
+Each weather factor is a small "gate" returning a structured
+:class:`~weather_agent.models.GateReading` (raw value, threshold, precomputed
+ratio, band, and a human reason). The worst gate decides the hour's overall
+verdict, and the limiting gates' reasons become the limiting factors. All
+functions are pure and unit-testable without network access. Thresholds are
+deliberately conservative and named for tuning.
 """
 
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import datetime
 from typing import TYPE_CHECKING
 
-from weather_agent.models import DayOutlook, DroneAssessment, FlightWindow, HourAssessment, Verdict
+from weather_agent.models import (
+    DayOutlook,
+    DroneAssessment,
+    FlightWindow,
+    GateReading,
+    HourAssessment,
+    Verdict,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
@@ -42,9 +52,6 @@ _NO_OMNI_VISIBILITY_PENALTY_M = 3000.0
 _LOW_LIGHT_VISIBILITY_BONUS_M = 2000.0
 
 _SEVERITY = {Verdict.GOOD: 0, Verdict.MARGINAL: 1, Verdict.NO_FLY: 2}
-
-# A gate result: a verdict plus a reason (empty string when the gate is GOOD).
-_Gate = tuple[Verdict, str]
 
 
 def _parse_hour_or_none(time_str: str) -> datetime | None:
@@ -100,58 +107,106 @@ def _effective_gust_limits(profile: DroneProfile) -> tuple[float, float]:
     return profile.ideal_gust_ms * factor, profile.caution_gust_ms * factor
 
 
-def _wind_gate(profile: DroneProfile, governing_ms: float | None) -> _Gate:
-    if governing_ms is None:
-        return (Verdict.MARGINAL, "wind data unavailable")
+def _wind_gate(profile: DroneProfile, governing_ms: float | None) -> GateReading:
     ideal, caution = _effective_gust_limits(profile)
+    if governing_ms is None:
+        return GateReading("wind_gust", Verdict.MARGINAL, "wind data unavailable", unit="m/s")
     fpv = " (FPV: reduced gust margin)" if profile.is_fpv else ""
     if governing_ms > caution:
-        return (
-            Verdict.NO_FLY,
-            f"gusts ~{governing_ms:.0f} m/s exceed the {caution:.0f} m/s limit{fpv}",
+        band = Verdict.NO_FLY
+        reason = (
+            f"gusts ~{governing_ms:.0f} m/s, {governing_ms / caution:.1f}x "
+            f"the {caution:.0f} m/s limit{fpv}"
         )
-    if governing_ms > ideal:
-        return (Verdict.MARGINAL, f"gusts ~{governing_ms:.0f} m/s near the wind limit{fpv}")
-    return (Verdict.GOOD, "")
+    elif governing_ms > ideal:
+        band = Verdict.MARGINAL
+        reason = (
+            f"gusts ~{governing_ms:.0f} m/s, {governing_ms / caution * 100:.0f}% "
+            f"of the {caution:.0f} m/s limit{fpv}"
+        )
+    else:
+        band, reason = Verdict.GOOD, ""
+    return GateReading("wind_gust", band, reason, value=governing_ms, unit="m/s", threshold=caution)
 
 
-def _precipitation_gate(hour: DroneFlightHour) -> _Gate:
+def _precipitation_gate(hour: DroneFlightHour) -> GateReading:
     if hour.precipitation_mm is not None and hour.precipitation_mm > 0:
-        return (Verdict.NO_FLY, "precipitation expected (drone is not water-resistant)")
+        return GateReading(
+            "precipitation",
+            Verdict.NO_FLY,
+            "precipitation expected (drone is not water-resistant)",
+            value=hour.precipitation_mm,
+            unit="mm",
+        )
     probability = hour.precipitation_probability_pct
+    threshold = _PRECIP_PROBABILITY_NO_FLY_PCT
     if probability is None:
-        return (Verdict.GOOD, "")
+        return GateReading("precip_probability", Verdict.GOOD, unit="%", threshold=threshold)
     if probability >= _PRECIP_PROBABILITY_NO_FLY_PCT:
-        return (Verdict.NO_FLY, f"{probability:.0f}% chance of precipitation")
-    if probability > _PRECIP_PROBABILITY_MARGINAL_PCT:
-        return (Verdict.MARGINAL, f"{probability:.0f}% chance of precipitation")
-    return (Verdict.GOOD, "")
+        band = Verdict.NO_FLY
+    elif probability > _PRECIP_PROBABILITY_MARGINAL_PCT:
+        band = Verdict.MARGINAL
+    else:
+        band = Verdict.GOOD
+    reason = "" if band is Verdict.GOOD else f"{probability:.0f}% chance of precipitation"
+    return GateReading(
+        "precip_probability", band, reason, value=probability, unit="%", threshold=threshold
+    )
 
 
-def _temperature_gate(profile: DroneProfile, hour: DroneFlightHour) -> _Gate:
+def _temperature_gate(profile: DroneProfile, hour: DroneFlightHour) -> GateReading:
     temperature = hour.temperature_c
     if temperature is None:
-        return (Verdict.GOOD, "")
+        return GateReading("temperature", Verdict.GOOD, unit="C")
     if temperature < profile.min_temp_c or temperature > profile.max_temp_c:
-        return (Verdict.NO_FLY, f"temperature {temperature:.0f} C outside operating range")
+        bound = profile.min_temp_c if temperature < profile.min_temp_c else profile.max_temp_c
+        reason = (
+            f"temperature {temperature:.0f} C outside the "
+            f"{profile.min_temp_c:.0f} to {profile.max_temp_c:.0f} C range"
+        )
+        return GateReading(
+            "temperature", Verdict.NO_FLY, reason, value=temperature, unit="C", threshold=bound
+        )
     # Feels-like cold drains batteries faster than the dry-bulb figure suggests.
     # Guard on None explicitly: an apparent temperature of exactly 0.0 C is a real,
     # freezing value, and `or` would wrongly discard it as falsy.
     apparent = hour.apparent_temperature_c
     feels_like = min(temperature, apparent if apparent is not None else temperature)
     if feels_like < _COLD_CAUTION_C:
-        return (Verdict.MARGINAL, f"cold (feels like {feels_like:.0f} C) reduces battery capacity")
-    return (Verdict.GOOD, "")
+        reason = f"cold (feels like {feels_like:.0f} C) reduces battery capacity"
+        return GateReading(
+            "feels_like",
+            Verdict.MARGINAL,
+            reason,
+            value=feels_like,
+            unit="C",
+            threshold=_COLD_CAUTION_C,
+        )
+    return GateReading("temperature", Verdict.GOOD, value=temperature, unit="C")
 
 
-def _icing_gate(hour: DroneFlightHour) -> _Gate:
+def _icing_gate(hour: DroneFlightHour) -> GateReading:
     freezing_level = hour.freezing_level_agl_m
     if freezing_level is not None and freezing_level <= _ICING_CEILING_M:
-        return (
-            Verdict.MARGINAL,
-            f"icing risk (freezing level ~{freezing_level:.0f} m AGL, within flight ceiling)",
+        reason = (
+            f"icing risk (freezing level ~{freezing_level:.0f} m AGL, "
+            f"at or below the {_ICING_CEILING_M:.0f} m ceiling)"
         )
-    return (Verdict.GOOD, "")
+        return GateReading(
+            "freezing_level_agl",
+            Verdict.MARGINAL,
+            reason,
+            value=freezing_level,
+            unit="m",
+            threshold=_ICING_CEILING_M,
+        )
+    return GateReading(
+        "freezing_level_agl",
+        Verdict.GOOD,
+        value=freezing_level,
+        unit="m",
+        threshold=_ICING_CEILING_M,
+    )
 
 
 def _visibility_threshold(profile: DroneProfile) -> float:
@@ -164,35 +219,59 @@ def _visibility_threshold(profile: DroneProfile) -> float:
     return threshold
 
 
-def _daylight_visibility_gate(profile: DroneProfile, hour: DroneFlightHour) -> _Gate:
+def _daylight_visibility_gate(profile: DroneProfile, hour: DroneFlightHour) -> GateReading:
     if hour.is_day is False:
-        return (Verdict.NO_FLY, "night-time (outside daylight visual line of sight)")
+        return GateReading(
+            "daylight", Verdict.NO_FLY, "night-time (outside daylight visual line of sight)"
+        )
+    threshold = _visibility_threshold(profile)
     visibility = hour.visibility_m
-    if visibility is not None and visibility < _visibility_threshold(profile):
-        return (Verdict.MARGINAL, f"reduced visibility ({visibility / 1000:.0f} km)")
-    return (Verdict.GOOD, "")
+    if visibility is not None and visibility < threshold:
+        reason = (
+            f"reduced visibility ({visibility / 1000:.0f} km, "
+            f"below the {threshold / 1000:.0f} km threshold)"
+        )
+        return GateReading(
+            "visibility", Verdict.MARGINAL, reason, value=visibility, unit="m", threshold=threshold
+        )
+    return GateReading("visibility", Verdict.GOOD, value=visibility, unit="m", threshold=threshold)
 
 
-def _storm_gate(hour: DroneFlightHour) -> _Gate:
-    if hour.cape is not None and hour.cape >= _CAPE_MARGINAL:
-        return (Verdict.MARGINAL, f"thunderstorm potential (CAPE {hour.cape:.0f})")
-    return (Verdict.GOOD, "")
+def _storm_gate(hour: DroneFlightHour) -> GateReading:
+    cape = hour.cape
+    if cape is not None and cape >= _CAPE_MARGINAL:
+        reason = (
+            f"thunderstorm potential (CAPE {cape:.0f} J/kg, "
+            f"{cape / _CAPE_MARGINAL:.1f}x the {_CAPE_MARGINAL:.0f} threshold)"
+        )
+        return GateReading(
+            "cape", Verdict.MARGINAL, reason, value=cape, unit="J/kg", threshold=_CAPE_MARGINAL
+        )
+    return GateReading("cape", Verdict.GOOD, value=cape, unit="J/kg", threshold=_CAPE_MARGINAL)
 
 
-def _cloud_gate(hour: DroneFlightHour) -> _Gate:
+def _cloud_gate(hour: DroneFlightHour) -> GateReading:
     low_cloud = hour.cloud_cover_low_pct
     if low_cloud is not None and low_cloud >= _LOW_CLOUD_MARGINAL_PCT:
-        return (
+        reason = f"near-overcast low cloud ({low_cloud:.0f}%); check the cloud base stays clear"
+        return GateReading(
+            "low_cloud",
             Verdict.MARGINAL,
-            f"near-overcast low cloud ({low_cloud:.0f}%); check the cloud base stays clear",
+            reason,
+            value=low_cloud,
+            unit="%",
+            threshold=_LOW_CLOUD_MARGINAL_PCT,
         )
-    return (Verdict.GOOD, "")
+    return GateReading(
+        "low_cloud", Verdict.GOOD, value=low_cloud, unit="%", threshold=_LOW_CLOUD_MARGINAL_PCT
+    )
 
 
-def _geomagnetic_gate(kp_index: float | None) -> _Gate:
+def _geomagnetic_gate(kp_index: float | None) -> GateReading:
     if kp_index is not None and kp_index >= _KP_CAUTION:
-        return (Verdict.MARGINAL, f"geomagnetic storm (Kp {kp_index:.0f}; GPS/compass risk)")
-    return (Verdict.GOOD, "")
+        reason = f"geomagnetic storm (Kp {kp_index:.0f}; GPS/compass risk)"
+        return GateReading("kp", Verdict.MARGINAL, reason, value=kp_index, threshold=_KP_CAUTION)
+    return GateReading("kp", Verdict.GOOD, value=kp_index, threshold=_KP_CAUTION)
 
 
 def _worst_verdict(severity: int) -> Verdict:
@@ -229,13 +308,19 @@ def assess_hour(
         _cloud_gate(hour),
         _geomagnetic_gate(kp_index),
     )
-    worst = max(_SEVERITY[verdict] for verdict, _ in gates)
-    factors = tuple(reason for verdict, reason in gates if _SEVERITY[verdict] == worst and reason)
+    worst = max(_SEVERITY[gate.band] for gate in gates)
+    # A gate is "limiting" when it set (tied for) the worst non-good verdict.
+    readings = tuple(
+        replace(gate, limiting=gate.band is not Verdict.GOOD and _SEVERITY[gate.band] == worst)
+        for gate in gates
+    )
+    factors = tuple(reading.reason for reading in readings if reading.limiting and reading.reason)
     return HourAssessment(
         time=hour.time,
         verdict=_worst_verdict(worst),
         limiting_factors=factors,
         governing_wind_ms=governing,
+        readings=readings,
     )
 
 
