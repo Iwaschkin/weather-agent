@@ -3,8 +3,10 @@
 import pytest
 
 from weather_agent.parsing import (
+    AirspaceError,
     AviationError,
     OpenMeteoError,
+    parse_airspaces,
     parse_current_readings,
     parse_current_weather,
     parse_daily_almanac,
@@ -207,6 +209,42 @@ def test_parse_metars_rejects_non_list() -> None:
     """A non-array METAR payload raises an aviation error."""
     with pytest.raises(AviationError):
         _ = parse_metars({"not": "a list"})
+
+
+def test_parse_airspaces_maps_codes_and_limits() -> None:
+    """Airspace parsing maps type/class codes to labels and renders the lower limit."""
+    payload: dict[str, object] = {
+        "items": [
+            {
+                "name": "MANCHESTER CTR",
+                "type": 4,
+                "icaoClass": 3,
+                "lowerLimit": {"value": 0, "unit": 1, "referenceDatum": 0},
+            },
+            {
+                "name": "DANGER D123",
+                "type": 2,
+                "icaoClass": 8,
+                "lowerLimit": {"value": 1500, "unit": 1, "referenceDatum": 1},
+            },
+            {"no": "name here"},
+        ],
+    }
+
+    airspaces = parse_airspaces(payload)
+
+    assert len(airspaces) == 2  # the unnamed entry is skipped
+    assert airspaces[0].type_label == "CTR"
+    assert airspaces[0].icao_class == "D"
+    assert airspaces[0].lower_limit == "GND"
+    assert airspaces[1].type_label == "Danger"
+    assert airspaces[1].lower_limit == "1500 ft MSL"
+
+
+def test_parse_airspaces_rejects_missing_items() -> None:
+    """A payload without an items array raises an airspace error."""
+    with pytest.raises(AirspaceError):
+        _ = parse_airspaces({"no": "items"})
 
 
 def test_parse_daily_almanac_reads_sun_times() -> None:

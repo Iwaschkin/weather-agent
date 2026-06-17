@@ -19,6 +19,7 @@ from weather_agent.models import (
     SiteBriefing,
     Verdict,
 )
+from weather_agent.openaip import OpenAipClient
 from weather_agent.results import render
 from weather_agent.weather import SiteClients, drone_flight_summary
 
@@ -70,6 +71,18 @@ _METAR_BODY: list[object] = [
 ]
 
 
+_AIRSPACE_BODY: dict[str, object] = {
+    "items": [
+        {
+            "name": "MANCHESTER CTR",
+            "type": 4,
+            "icaoClass": 3,
+            "lowerLimit": {"value": 0, "unit": 1, "referenceDatum": 0},
+        },
+    ],
+}
+
+
 def _aviation(body: object) -> AviationClient:
     def handler(_request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, json=body)
@@ -77,8 +90,23 @@ def _aviation(body: object) -> AviationClient:
     return AviationClient(client=httpx.Client(transport=httpx.MockTransport(handler)))
 
 
-def _site_clients(metar_body: object) -> SiteClients:
-    return SiteClients(aviation=_aviation(metar_body))
+def _openaip(api_key: str, body: object) -> OpenAipClient:
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=body)
+
+    return OpenAipClient(
+        api_key=api_key, client=httpx.Client(transport=httpx.MockTransport(handler))
+    )
+
+
+def _site_clients(metar_body: object, airspace_body: object | None = None) -> SiteClients:
+    # An empty key short-circuits the airspace lookup (no network) for tests that
+    # do not care about it; a real key + body exercises the airspace path.
+    if airspace_body is None:
+        openaip = _openaip("", {"items": []})
+    else:
+        openaip = _openaip("test-key", airspace_body)
+    return SiteClients(aviation=_aviation(metar_body), openaip=openaip)
 
 
 def test_describe_drone_assessment_includes_all_sections() -> None:
@@ -179,7 +207,7 @@ def test_drone_flight_summary_assesses_known_drone() -> None:
             "Mini 5 Pro",
             client=_drone_client(),
             now=_NOW,
-            site_clients=_site_clients(_METAR_BODY),
+            site_clients=_site_clients(_METAR_BODY, _AIRSPACE_BODY),
         )
     )
 
@@ -188,6 +216,8 @@ def test_drone_flight_summary_assesses_known_drone() -> None:
     assert "UK CAA notes" in summary
     assert "Nearest METAR" in summary
     assert "EGCC" in summary
+    assert "Airspace near" in summary
+    assert "MANCHESTER CTR" in summary
 
 
 def test_drone_flight_summary_rejects_unknown_drone() -> None:

@@ -26,11 +26,13 @@ from weather_agent.flyability import assess_forecast
 from weather_agent.geocoding import parse_location, select_best_match
 from weather_agent.knowledge import load_sections, retrieve
 from weather_agent.models import ClimateRequest, HistoricalRequest, SiteBriefing
+from weather_agent.openaip import OpenAipClient
 from weather_agent.parsing import ExternalDataError, OpenMeteoError, SpaceWeatherError
 from weather_agent.reporting import (
     DAILY_VARIABLES,
     FORECAST_DAILY_VARIABLES,
     SOLAR_DAILY_VARIABLES,
+    describe_airspace,
     describe_comparison,
     describe_current_readings,
     describe_current_weather,
@@ -51,6 +53,7 @@ if TYPE_CHECKING:
     from collections.abc import Callable
 
     from weather_agent.models import (
+        Airspace,
         DayAlmanac,
         DroneFlightHour,
         GeocodeResult,
@@ -549,6 +552,46 @@ def aviation_summary(
             aviation.close()
 
 
+_NO_KEY_NOTE = "unavailable (no OPENAIP_API_KEY configured)"
+
+
+def airspace_summary(
+    location: str,
+    client: OpenMeteoClient | None = None,
+    openaip_client: OpenAipClient | None = None,
+) -> LookupOutcome:
+    """Build a nearby-airspace summary for a named location (decision support).
+
+    Requires an OpenAIP API key; without one the summary reports that the check is
+    unavailable rather than failing. Never authoritative - the rendered text always
+    points the reader to official airspace/NOTAM sources.
+
+    Args:
+        location: A city or place name.
+        client: Optional open-meteo client (used for geocoding).
+        openaip_client: Optional OpenAIP client; created and closed here when not
+            provided.
+
+    Returns:
+        An outcome wrapping the list of nearby drone-relevant airspaces, or a note
+        when no key is configured.
+    """
+    owns_openaip = openaip_client is None
+    openaip = openaip_client if openaip_client is not None else OpenAipClient()
+    try:
+
+        def describe(_active: OpenMeteoClient, place: GeocodeResult) -> str:
+            if not openaip.has_key:
+                return describe_airspace(_place_label(place), (), _NO_KEY_NOTE)
+            airspaces = openaip.nearby_airspaces(place.latitude, place.longitude)
+            return describe_airspace(_place_label(place), airspaces)
+
+        return _summarize(location, client, describe)
+    finally:
+        if owns_openaip:
+            openaip.close()
+
+
 def weather_for_date(
     location: str,
     when: str,
@@ -652,9 +695,11 @@ class SiteClients:
 
     Attributes:
         aviation: Client for nearest-METAR observations.
+        openaip: Client for nearby-airspace lookups (needs an API key).
     """
 
     aviation: AviationClient | None = None
+    openaip: OpenAipClient | None = None
 
 
 def _best_effort_kp(client: OpenMeteoClient) -> float | None:
@@ -708,6 +753,26 @@ def _best_effort_metar(
         return None
     except ExternalDataError:
         return None
+
+
+def _best_effort_airspace(
+    openaip: OpenAipClient,
+    latitude: float,
+    longitude: float,
+) -> tuple[tuple[Airspace, ...], str]:
+    """Fetch nearby airspace; return (airspaces, status_note), degrading safely.
+
+    No key gives an "unavailable" note; a network or payload failure gives a
+    "lookup failed" note. Either way the assessment continues.
+    """
+    if not openaip.has_key:
+        return (), _NO_KEY_NOTE
+    try:
+        return openaip.nearby_airspaces(latitude, longitude), ""
+    except httpx.HTTPError:
+        return (), "unavailable (airspace lookup failed)"
+    except ExternalDataError:
+        return (), "unavailable (airspace lookup failed)"
 
 
 def _kp_buckets(entries: tuple[KpForecastEntry, ...]) -> list[tuple[datetime, float]]:
@@ -808,13 +873,18 @@ def drone_flight_summary(
     site = site_clients if site_clients is not None else SiteClients()
     owns_aviation = site.aviation is None
     aviation = site.aviation if site.aviation is not None else AviationClient()
+    owns_openaip = site.openaip is None
+    openaip = site.openaip if site.openaip is not None else OpenAipClient()
 
     def describe(active: OpenMeteoClient, place: GeocodeResult) -> str:
         forecast = active.drone_forecast(place.latitude, place.longitude, _DRONE_FORECAST_DAYS)
         kp_by_time = _drone_kp_by_hour(active, forecast.hours)
+        airspaces, airspace_note = _best_effort_airspace(openaip, place.latitude, place.longitude)
         briefing = SiteBriefing(
             sun_times=_best_effort_almanac(active, place.latitude, place.longitude),
             metar=_best_effort_metar(aviation, place.latitude, place.longitude),
+            airspace=airspaces,
+            airspace_note=airspace_note,
         )
         assessment = assess_forecast(profile, forecast, _place_label(place), kp_by_time, reference)
         factors = " ".join(factor for hour in assessment.hours for factor in hour.limiting_factors)
@@ -826,3 +896,5 @@ def drone_flight_summary(
     finally:
         if owns_aviation:
             aviation.close()
+        if owns_openaip:
+            openaip.close()

@@ -7,6 +7,7 @@ from weather_agent.tools import (
     assess_drone_conditions,
     compare_weather,
     get_air_quality,
+    get_airspace,
     get_aviation_weather,
     get_climate_projection,
     get_current_weather,
@@ -37,8 +38,9 @@ _SYSTEM_PROMPT = (
     "get_marine_forecast (waves, coastal points), get_river_discharge (flood "
     "indicator), get_ensemble_forecast (forecast uncertainty), get_uv_index (sun "
     "safety), get_solar_potential (solar energy outlook), get_sun_times (sunrise, "
-    "sunset, daylight), get_aviation_weather (nearest airport observed METAR), and "
-    "get_elevation (terrain height). When the user gives a "
+    "sunset, daylight), get_aviation_weather (nearest airport observed METAR), "
+    "get_airspace (nearby controlled/restricted airspace, decision support only - "
+    "not authoritative), and get_elevation (terrain height). When the user gives a "
     "latitude and longitude instead of a place name, "
     "use get_weather_at_coordinates. For drone flying (DJI Neo, "
     "Avata 2, Mini 5 Pro) use assess_drone_conditions, and list_supported_drones to "
@@ -87,6 +89,7 @@ def build_agent(
             get_solar_potential,
             get_sun_times,
             get_aviation_weather,
+            get_airspace,
             get_elevation,
             get_weather_at_coordinates,
             assess_drone_conditions,

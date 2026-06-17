@@ -9,6 +9,7 @@ from weather_agent.drone_report import describe_supported_drones
 from weather_agent.results import render
 from weather_agent.weather import (
     air_quality_summary,
+    airspace_summary,
     aviation_summary,
     climate_summary,
     compare_periods,
@@ -209,6 +210,24 @@ def get_solar_potential(location: str, days: int = 3) -> str:
         explanatory message when the location cannot be resolved.
     """
     return render(solar_summary(location, days))
+
+
+@tool
+def get_airspace(location: str) -> str:
+    """List nearby controlled or restricted airspace for a location (verify officially).
+
+    Decision support only, not an authoritative airspace or NOTAM check: always
+    confirm with CAA Drone Assist or an official source before flying. Needs an
+    OpenAIP API key; without one it reports the check as unavailable.
+
+    Args:
+        location: A city or place name, for example "Congleton UK".
+
+    Returns:
+        A list of nearby drone-relevant airspace volumes, a "none found" note, or a
+        message that the lookup is unavailable.
+    """
+    return render(airspace_summary(location))
 
 
 @tool
