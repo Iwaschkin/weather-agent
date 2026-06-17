@@ -13,10 +13,12 @@ from weather_agent.parsing import (
     DRONE_HOURLY_REQUEST,
     parse_current_readings,
     parse_current_weather,
+    parse_daily_almanac,
     parse_drone_forecast,
     parse_elevation,
     parse_geocode_results,
     parse_kp,
+    parse_kp_forecast,
     parse_time_series,
     parse_uv_index,
 )
@@ -28,10 +30,12 @@ if TYPE_CHECKING:
         ClimateRequest,
         CurrentReadings,
         CurrentWeather,
+        DayAlmanac,
         DroneForecast,
         Elevation,
         GeocodeResult,
         HistoricalRequest,
+        KpForecastEntry,
         KpIndex,
         TimeSeries,
         UvIndex,
@@ -47,6 +51,9 @@ _FLOOD_URL = "https://flood-api.open-meteo.com/v1/flood"
 _ENSEMBLE_URL = "https://ensemble-api.open-meteo.com/v1/ensemble"
 _ELEVATION_URL = "https://api.open-meteo.com/v1/elevation"
 _PLANETARY_KP_URL = "https://services.swpc.noaa.gov/products/noaa-planetary-k-index.json"
+_PLANETARY_KP_FORECAST_URL = (
+    "https://services.swpc.noaa.gov/products/noaa-planetary-k-index-forecast.json"
+)
 _DEFAULT_TIMEOUT = 10.0
 _DEFAULT_TIMEZONE = "Europe/London"
 _CURRENT_WEATHER_REQUEST = (
@@ -146,6 +153,43 @@ class OpenMeteoClient:
         )
         return parse_current_weather(payload)
 
+    def daily_almanac(
+        self,
+        latitude: float,
+        longitude: float,
+        forecast_days: int = 1,
+        timezone: str = "auto",
+    ) -> tuple[DayAlmanac, ...]:
+        """Fetch daily sun times (sunrise/sunset/daylight) for a coordinate.
+
+        Uses ``timezone=auto`` by default so the sun times are the location's local
+        times rather than UTC.
+
+        Args:
+            latitude: Latitude in decimal degrees.
+            longitude: Longitude in decimal degrees.
+            forecast_days: Number of days to fetch (today onward).
+            timezone: IANA timezone name, or ``"auto"`` for the location's zone.
+
+        Returns:
+            One almanac row per day, in chronological order.
+
+        Raises:
+            httpx.HTTPError: If the request fails or returns an error status.
+            OpenMeteoError: If the response shape is unexpected.
+        """
+        payload = self._get_json(
+            _FORECAST_URL,
+            {
+                "latitude": latitude,
+                "longitude": longitude,
+                "daily": "sunrise,sunset,daylight_duration",
+                "forecast_days": forecast_days,
+                "timezone": timezone,
+            },
+        )
+        return parse_daily_almanac(payload)
+
     def uv_index(self, latitude: float, longitude: float) -> UvIndex:
         """Fetch the current UV index and today's maximum for a coordinate.
 
@@ -230,6 +274,19 @@ class OpenMeteoClient:
         """
         payload = self._get_json(_PLANETARY_KP_URL, {})
         return parse_kp(payload)
+
+    def geomagnetic_kp_forecast(self) -> tuple[KpForecastEntry, ...]:
+        """Fetch NOAA SWPC's 3-day planetary K-index forecast.
+
+        Returns:
+            The predicted 3-hour Kp buckets (UTC) in chronological order.
+
+        Raises:
+            httpx.HTTPError: If the request fails or returns an error status.
+            SpaceWeatherError: If the response shape is unexpected.
+        """
+        payload = self._get_json(_PLANETARY_KP_FORECAST_URL, {})
+        return parse_kp_forecast(payload)
 
     def forecast_series(
         self,

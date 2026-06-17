@@ -6,7 +6,7 @@ from datetime import datetime
 import pytest
 
 from weather_agent.drone import AVATA_2, MINI_5_PRO, NEO, find_profile
-from weather_agent.flyability import assess_forecast, assess_hour, best_window
+from weather_agent.flyability import assess_forecast, assess_hour, best_window, daily_outlooks
 from weather_agent.models import (
     DroneFlightHour,
     DroneForecast,
@@ -27,6 +27,7 @@ _GOOD_HOUR = DroneFlightHour(
     cape=0.0,
     freezing_level_agl_m=2500.0,
     is_day=True,
+    cloud_cover_low_pct=10.0,
 )
 
 
@@ -149,6 +150,15 @@ def test_assess_hour_no_icing_when_freezing_level_high() -> None:
     assert result.verdict is Verdict.GOOD
 
 
+def test_assess_hour_marginal_on_low_cloud() -> None:
+    """Near-overcast low cloud flags a possible low ceiling to check."""
+    cloudy = replace(_GOOD_HOUR, cloud_cover_low_pct=95.0)
+    result = assess_hour(MINI_5_PRO, cloudy)
+
+    assert result.verdict is Verdict.MARGINAL
+    assert any("low cloud" in factor for factor in result.limiting_factors)
+
+
 def test_assess_hour_marginal_on_high_kp() -> None:
     """A geomagnetic storm makes otherwise-good conditions marginal."""
     result = assess_hour(MINI_5_PRO, _GOOD_HOUR, kp_index=6.0)
@@ -209,6 +219,55 @@ def test_assess_forecast_builds_full_assessment() -> None:
     assert assessment.hours[1].verdict is Verdict.NO_FLY
     assert assessment.best_window is not None
     assert assessment.best_window.start_time == "10:00"
+
+
+def test_assess_forecast_applies_per_hour_kp() -> None:
+    """A per-hour Kp map flags only the storm-affected hour, not the whole window."""
+    forecast = DroneForecast(
+        elevation_m=120.0,
+        hours=(
+            replace(_GOOD_HOUR, time="2026-06-16T10:00"),
+            replace(_GOOD_HOUR, time="2026-06-16T11:00"),
+        ),
+    )
+    kp_by_time = {"2026-06-16T11:00": 6.0}
+
+    assessment = assess_forecast(MINI_5_PRO, forecast, "Congleton", kp_by_time=kp_by_time)
+
+    assert assessment.hours[0].verdict is Verdict.GOOD
+    assert assessment.hours[1].verdict is Verdict.MARGINAL
+    assert any("geomagnetic" in factor for factor in assessment.hours[1].limiting_factors)
+
+
+def test_assess_forecast_builds_daily_outlook() -> None:
+    """The assessment carries a per-day outlook over the window."""
+    forecast = DroneForecast(
+        elevation_m=120.0,
+        hours=(
+            replace(_GOOD_HOUR, time="2026-06-16T10:00"),
+            replace(_GOOD_HOUR, time="2026-06-17T10:00"),
+        ),
+    )
+
+    assessment = assess_forecast(MINI_5_PRO, forecast, "Congleton")
+
+    assert [day.date for day in assessment.daily] == ["2026-06-16", "2026-06-17"]
+
+
+def test_daily_outlooks_groups_and_counts_good_hours() -> None:
+    """Per-day outlooks group by date and count good hours with a best window."""
+    hours = (
+        HourAssessment("2026-06-16T10:00", Verdict.GOOD, (), 4.0),
+        HourAssessment("2026-06-16T11:00", Verdict.NO_FLY, ("rain",), 4.0),
+        HourAssessment("2026-06-17T09:00", Verdict.GOOD, (), 4.0),
+    )
+
+    outlooks = daily_outlooks(hours)
+
+    assert [day.date for day in outlooks] == ["2026-06-16", "2026-06-17"]
+    assert outlooks[0].good_hours == 1
+    assert outlooks[0].best_window is not None
+    assert outlooks[1].good_hours == 1
 
 
 def test_assess_forecast_drops_elapsed_hours() -> None:

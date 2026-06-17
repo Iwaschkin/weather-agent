@@ -38,6 +38,7 @@ from weather_agent.reporting import (
     describe_latest_values,
     describe_period,
     describe_solar,
+    describe_sun_times,
     describe_uv,
 )
 from weather_agent.results import Answer, Failed, Invalid, LookupOutcome, NotFound
@@ -46,7 +47,7 @@ from weather_agent.routing import FORECAST_HORIZON_DAYS, DataSource, select_data
 if TYPE_CHECKING:
     from collections.abc import Callable
 
-    from weather_agent.models import GeocodeResult
+    from weather_agent.models import DayAlmanac, DroneFlightHour, GeocodeResult, KpForecastEntry
 
 _DEFAULT_CLIMATE_MODEL = "EC_Earth3P_HR"
 _DEFAULT_ENSEMBLE_MODEL = "icon_seamless"
@@ -445,6 +446,32 @@ def solar_summary(
     return _summarize(location, client, describe)
 
 
+def sun_times_summary(
+    location: str,
+    days: int = 1,
+    client: OpenMeteoClient | None = None,
+) -> LookupOutcome:
+    """Build a sunrise/sunset/daylight summary for a named location.
+
+    Args:
+        location: A city or place name.
+        days: Number of days to report (1 to the forecast horizon).
+        client: Optional client to use.
+
+    Returns:
+        An outcome wrapping daily sun times, or an invalid-input outcome when
+        ``days`` is out of range.
+    """
+    if not 1 <= days <= FORECAST_HORIZON_DAYS:
+        return Invalid(f"Days must be between 1 and {FORECAST_HORIZON_DAYS} (got {days}).")
+
+    def describe(active: OpenMeteoClient, place: GeocodeResult) -> str:
+        almanac = active.daily_almanac(place.latitude, place.longitude, days)
+        return describe_sun_times(_place_label(place), almanac)
+
+    return _summarize(location, client, describe)
+
+
 def _coordinate_label(latitude: float, longitude: float) -> str:
     return f"{latitude:.4f}, {longitude:.4f}"
 
@@ -569,7 +596,7 @@ def compare_periods(
     return _summarize(location, client, describe)
 
 
-_DRONE_FORECAST_DAYS = 2
+_DRONE_FORECAST_DAYS = 5
 _UK_TIMEZONE = ZoneInfo("Europe/London")
 
 
@@ -577,8 +604,8 @@ def _best_effort_kp(client: OpenMeteoClient) -> float | None:
     """Fetch the latest planetary Kp, returning None on any failure.
 
     Geomagnetic data is a useful but non-essential signal, so a NOAA outage must
-    not break the whole assessment. Note this is the single current Kp value used
-    as a constant proxy across the forecast window, not a per-hour Kp forecast.
+    not break the whole assessment. This single current value is the fallback when
+    the per-hour Kp forecast is unavailable.
     """
     try:
         return client.geomagnetic_kp().kp
@@ -586,6 +613,89 @@ def _best_effort_kp(client: OpenMeteoClient) -> float | None:
         return None
     except SpaceWeatherError:
         return None
+
+
+def _best_effort_kp_forecast(client: OpenMeteoClient) -> tuple[KpForecastEntry, ...]:
+    """Fetch the planetary Kp forecast, returning an empty tuple on any failure."""
+    try:
+        return client.geomagnetic_kp_forecast()
+    except httpx.HTTPError:
+        return ()
+    except SpaceWeatherError:
+        return ()
+
+
+def _best_effort_almanac(
+    client: OpenMeteoClient,
+    latitude: float,
+    longitude: float,
+) -> tuple[DayAlmanac, ...]:
+    """Fetch sun times for the assessment window, returning () on any failure."""
+    try:
+        return client.daily_almanac(latitude, longitude, _DRONE_FORECAST_DAYS)
+    except (httpx.HTTPError, OpenMeteoError):
+        return ()
+
+
+def _kp_buckets(entries: tuple[KpForecastEntry, ...]) -> list[tuple[datetime, float]]:
+    parsed: list[tuple[datetime, float]] = []
+    for entry in entries:
+        try:
+            when = datetime.fromisoformat(entry.time).replace(tzinfo=UTC)
+        except ValueError:
+            continue
+        parsed.append((when, entry.kp))
+    parsed.sort(key=lambda bucket: bucket[0])
+    return parsed
+
+
+def _kp_at(buckets: list[tuple[datetime, float]], when_utc: datetime) -> float | None:
+    chosen: float | None = None
+    for bucket_time, kp in buckets:
+        if bucket_time <= when_utc:
+            chosen = kp
+        else:
+            break
+    if chosen is None and buckets:
+        # Before the first published bucket: use the earliest as the best estimate.
+        return buckets[0][1]
+    return chosen
+
+
+def _resolve_kp_by_hour(
+    hours: tuple[DroneFlightHour, ...],
+    entries: tuple[KpForecastEntry, ...],
+) -> dict[str, float] | None:
+    """Map each forecast hour's timestamp to the Kp predicted for that hour.
+
+    The Kp forecast is in 3-hour UTC buckets; forecast hours are UK-local naive
+    timestamps, so each is localised and converted to UTC before bucket lookup.
+    """
+    buckets = _kp_buckets(entries)
+    if not buckets:
+        return None
+    mapping: dict[str, float] = {}
+    for hour in hours:
+        try:
+            local = datetime.fromisoformat(hour.time).replace(tzinfo=_UK_TIMEZONE)
+        except ValueError:
+            continue
+        kp = _kp_at(buckets, local.astimezone(UTC))
+        if kp is not None:
+            mapping[hour.time] = kp
+    return mapping or None
+
+
+def _drone_kp_by_hour(
+    client: OpenMeteoClient,
+    hours: tuple[DroneFlightHour, ...],
+) -> dict[str, float] | None:
+    """Resolve per-hour Kp from the forecast, falling back to the current value."""
+    forecast = _resolve_kp_by_hour(hours, _best_effort_kp_forecast(client))
+    if forecast is not None:
+        return forecast
+    current = _best_effort_kp(client)
+    return {hour.time: current for hour in hours} if current is not None else None
 
 
 def drone_flight_summary(
@@ -622,10 +732,11 @@ def drone_flight_summary(
 
     def describe(active: OpenMeteoClient, place: GeocodeResult) -> str:
         forecast = active.drone_forecast(place.latitude, place.longitude, _DRONE_FORECAST_DAYS)
-        kp_index = _best_effort_kp(active)
-        assessment = assess_forecast(profile, forecast, _place_label(place), kp_index, reference)
+        kp_by_time = _drone_kp_by_hour(active, forecast.hours)
+        sun_times = _best_effort_almanac(active, place.latitude, place.longitude)
+        assessment = assess_forecast(profile, forecast, _place_label(place), kp_by_time, reference)
         factors = " ".join(factor for hour in assessment.hours for factor in hour.limiting_factors)
         tips = retrieve(factors or "pre-flight wind battery", load_sections())
-        return describe_drone_assessment(assessment, caa_guidance(profile), tips)
+        return describe_drone_assessment(assessment, caa_guidance(profile), tips, sun_times)
 
     return _summarize(location, client, describe)

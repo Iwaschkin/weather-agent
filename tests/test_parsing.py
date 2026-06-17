@@ -6,6 +6,7 @@ from weather_agent.parsing import (
     OpenMeteoError,
     parse_current_readings,
     parse_current_weather,
+    parse_daily_almanac,
     parse_elevation,
     parse_geocode_results,
     parse_time_series,
@@ -165,6 +166,35 @@ def test_parse_current_weather_optional_fields_default_none() -> None:
 
     assert weather.weather_code is None
     assert weather.surface_pressure_hpa is None
+
+
+def test_parse_daily_almanac_reads_sun_times() -> None:
+    """The almanac parser reads string sunrise/sunset and numeric daylight."""
+    payload: dict[str, object] = {
+        "daily": {
+            "time": ["2026-06-16", "2026-06-17"],
+            "sunrise": ["2026-06-16T04:43", "2026-06-17T04:43"],
+            "sunset": ["2026-06-16T21:21", "2026-06-17T21:22"],
+            "daylight_duration": [59880.0, 59940.0],
+        },
+    }
+
+    almanac = parse_daily_almanac(payload)
+
+    assert len(almanac) == 2
+    assert almanac[0].date == "2026-06-16"
+    assert almanac[0].sunrise == "2026-06-16T04:43"
+    assert almanac[0].daylight_seconds == 59880.0
+
+
+def test_parse_daily_almanac_tolerates_missing_columns() -> None:
+    """Missing sun columns degrade to empty strings and None, not errors."""
+    payload: dict[str, object] = {"daily": {"time": ["2026-06-16"]}}
+
+    almanac = parse_daily_almanac(payload)
+
+    assert almanac[0].sunrise == ""
+    assert almanac[0].daylight_seconds is None
 
 
 def test_parse_uv_index_reads_current_and_today_max() -> None:

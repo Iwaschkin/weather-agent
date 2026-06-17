@@ -12,9 +12,16 @@ from typing import TYPE_CHECKING
 from weather_agent.weather_codes import describe_weather_code
 
 if TYPE_CHECKING:
-    from weather_agent.models import CurrentReadings, CurrentWeather, TimeSeries, UvIndex
+    from weather_agent.models import (
+        CurrentReadings,
+        CurrentWeather,
+        DayAlmanac,
+        TimeSeries,
+        UvIndex,
+    )
 
 _SECONDS_PER_HOUR = 3600.0
+_HHMM_LENGTH = 5  # length of an "HH:MM" clock string
 _SOLAR_RADIATION_SUM = "shortwave_radiation_sum"
 _SUNSHINE_DURATION = "sunshine_duration"
 _DAYLIGHT_DURATION = "daylight_duration"
@@ -367,3 +374,43 @@ def describe_solar(place_label: str, series: TimeSeries, max_days: int) -> str:
 
 def _hours(seconds: float | None) -> str:
     return "n/a" if seconds is None else f"{seconds / _SECONDS_PER_HOUR:.1f} h"
+
+
+def format_clock(iso_timestamp: str) -> str:
+    """Extract a ``HH:MM`` clock time from an ISO-8601 local timestamp.
+
+    Args:
+        iso_timestamp: An ISO timestamp such as ``"2026-06-17T04:45"`` (or an empty
+            string when the time is unavailable).
+
+    Returns:
+        The ``HH:MM`` portion, or ``"n/a"`` when the input is empty or has no time
+        component.
+    """
+    if "T" not in iso_timestamp:
+        return "n/a"
+    time_part = iso_timestamp.split("T", 1)[1]
+    return time_part[:_HHMM_LENGTH] if len(time_part) >= _HHMM_LENGTH else "n/a"
+
+
+def describe_sun_times(place_label: str, almanac: tuple[DayAlmanac, ...]) -> str:
+    """Render daily sunrise, sunset, and daylight length for a location.
+
+    Args:
+        place_label: Human-readable location name.
+        almanac: One row per day, in chronological order.
+
+    Returns:
+        A multi-line sun-times summary, or a note when no rows are available.
+    """
+    if not almanac:
+        return f"No sun-time data available for {place_label}."
+    lines = [
+        (
+            f"{day.date}: sunrise {format_clock(day.sunrise)}, "
+            f"sunset {format_clock(day.sunset)}, "
+            f"daylight {_hours(day.daylight_seconds)}"
+        )
+        for day in almanac
+    ]
+    return f"Sun times for {place_label}:\n" + "\n".join(lines)

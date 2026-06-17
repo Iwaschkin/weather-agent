@@ -121,6 +121,28 @@ class CurrentReadings:
 
 
 @dataclass(frozen=True, slots=True)
+class DayAlmanac:
+    """Sun times for a single day at a coordinate.
+
+    Sunrise and sunset are ISO-8601 local datetimes (strings, as the API returns
+    them), so they are kept as text rather than forced through the numeric time
+    series. ``daylight_seconds`` is numeric.
+
+    Attributes:
+        date: The ISO-8601 calendar date (``YYYY-MM-DD``).
+        sunrise: ISO-8601 local sunrise timestamp, or an empty string when absent.
+        sunset: ISO-8601 local sunset timestamp, or an empty string when absent.
+        daylight_seconds: Total daylight for the day, in seconds, or ``None`` when
+            unavailable.
+    """
+
+    date: str
+    sunrise: str
+    sunset: str
+    daylight_seconds: float | None
+
+
+@dataclass(frozen=True, slots=True)
 class UvIndex:
     """Ultraviolet index for a coordinate: the value now and today's peak.
 
@@ -217,6 +239,9 @@ class DroneFlightHour:
         freezing_level_agl_m: Height of the 0 degC isotherm above ground level, in
             metres; negative when the air at the surface is already below freezing.
         is_day: Whether the hour is in daylight, or ``None`` when unknown.
+        cloud_cover_low_pct: Low-cloud cover, in percent; a high value can mean a
+            cloud base low enough to crowd the 120 m ceiling or visual line of
+            sight, or ``None`` when unknown.
     """
 
     time: str
@@ -230,6 +255,7 @@ class DroneFlightHour:
     cape: float | None
     freezing_level_agl_m: float | None
     is_day: bool | None
+    cloud_cover_low_pct: float | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -328,6 +354,22 @@ class FlightWindow:
 
 
 @dataclass(frozen=True, slots=True)
+class DayOutlook:
+    """A one-line flyability outlook for a single calendar day.
+
+    Attributes:
+        date: The ISO-8601 calendar date (``YYYY-MM-DD``).
+        good_hours: Number of good-to-fly hours that day.
+        best_window: The best contiguous good window that day, or ``None`` when no
+            hour was good.
+    """
+
+    date: str
+    good_hours: int
+    best_window: FlightWindow | None
+
+
+@dataclass(frozen=True, slots=True)
 class DroneAssessment:
     """A full per-hour flyability assessment for one drone at one place.
 
@@ -337,12 +379,15 @@ class DroneAssessment:
         hours: Per-hour verdicts in chronological order.
         best_window: The best contiguous good-to-fly window, or ``None`` when no
             hour was good.
+        daily: A per-day outlook over the assessment window (empty when the window
+            is empty), so multi-day forecasts can be skimmed day by day.
     """
 
     drone_name: str
     place_label: str
     hours: tuple[HourAssessment, ...]
     best_window: FlightWindow | None
+    daily: tuple[DayOutlook, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -382,6 +427,19 @@ class KpIndex:
     Attributes:
         time: Timestamp of the observation as reported by NOAA SWPC.
         kp: The planetary K-index value.
+    """
+
+    time: str
+    kp: float
+
+
+@dataclass(frozen=True, slots=True)
+class KpForecastEntry:
+    """A single predicted planetary K-index value for a future 3-hour bucket.
+
+    Attributes:
+        time: NOAA SWPC timestamp for the bucket, in UTC.
+        kp: The predicted planetary K-index for that bucket.
     """
 
     time: str

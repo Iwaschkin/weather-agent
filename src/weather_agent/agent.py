@@ -17,6 +17,7 @@ from weather_agent.tools import (
     get_pollen,
     get_river_discharge,
     get_solar_potential,
+    get_sun_times,
     get_uv_index,
     get_weather,
     get_weather_at_coordinates,
@@ -34,8 +35,9 @@ _SYSTEM_PROMPT = (
     "get_air_quality (pollution and AQI), get_pollen (allergens, Europe), "
     "get_marine_forecast (waves, coastal points), get_river_discharge (flood "
     "indicator), get_ensemble_forecast (forecast uncertainty), get_uv_index (sun "
-    "safety), get_solar_potential (solar energy outlook), and get_elevation (terrain "
-    "height). When the user gives a latitude and longitude instead of a place name, "
+    "safety), get_solar_potential (solar energy outlook), get_sun_times (sunrise, "
+    "sunset, daylight), and get_elevation (terrain height). When the user gives a "
+    "latitude and longitude instead of a place name, "
     "use get_weather_at_coordinates. For drone flying (DJI Neo, "
     "Avata 2, Mini 5 Pro) use assess_drone_conditions, and list_supported_drones to "
     "see which models are covered; always pass on its UK CAA notes and safety "
@@ -81,6 +83,7 @@ def build_agent(
             get_ensemble_forecast,
             get_uv_index,
             get_solar_potential,
+            get_sun_times,
             get_elevation,
             get_weather_at_coordinates,
             assess_drone_conditions,

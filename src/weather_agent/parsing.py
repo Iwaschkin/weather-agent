@@ -10,10 +10,12 @@ from typing import cast
 from weather_agent.models import (
     CurrentReadings,
     CurrentWeather,
+    DayAlmanac,
     DroneFlightHour,
     DroneForecast,
     Elevation,
     GeocodeResult,
+    KpForecastEntry,
     KpIndex,
     TimeSeries,
     UvIndex,
@@ -194,6 +196,68 @@ def parse_uv_index(payload: object) -> UvIndex:
     )
 
 
+def _string_at(items: list[object], index: int) -> str:
+    if index < len(items):
+        value = items[index]
+        if isinstance(value, str):
+            return value
+    return ""
+
+
+def _string_column(raw: object, count: int) -> list[str]:
+    # Sun times are ISO strings, not floats, so they bypass the numeric series.
+    # A missing or short column degrades to empty strings rather than raising.
+    if not isinstance(raw, list):
+        return [""] * count
+    items = cast("list[object]", raw)
+    return [_string_at(items, index) for index in range(count)]
+
+
+def _optional_float_column(raw: object, count: int) -> list[float | None]:
+    if not isinstance(raw, list):
+        return [None] * count
+    items = cast("list[object]", raw)
+    return [
+        _coerce_float_or_none(items[i], "daylight_duration") if i < len(items) else None
+        for i in range(count)
+    ]
+
+
+def parse_daily_almanac(payload: object) -> tuple[DayAlmanac, ...]:
+    """Parse a daily sun-times payload (sunrise/sunset/daylight) into almanac rows.
+
+    Sunrise and sunset arrive as ISO strings, so they bypass the numeric
+    :class:`TimeSeries` and are read directly here.
+
+    Args:
+        payload: Decoded JSON from the forecast endpoint requested with
+            ``daily=sunrise,sunset,daylight_duration``.
+
+    Returns:
+        One :class:`DayAlmanac` per day, in chronological order.
+
+    Raises:
+        OpenMeteoError: If the payload, its ``daily`` block, or the ``time`` array
+            is missing or has an unexpected shape.
+    """
+    body = _require_mapping(payload, "almanac response")
+    block = _require_mapping(body.get("daily"), "daily block")
+    raw_dates = _require_list(block.get("time"), "daily time array")
+    dates = [_require_str_value(value, "daily date") for value in raw_dates]
+    sunrises = _string_column(block.get("sunrise"), len(dates))
+    sunsets = _string_column(block.get("sunset"), len(dates))
+    daylight = _optional_float_column(block.get("daylight_duration"), len(dates))
+    return tuple(
+        DayAlmanac(
+            date=dates[index],
+            sunrise=sunrises[index],
+            sunset=sunsets[index],
+            daylight_seconds=daylight[index],
+        )
+        for index in range(len(dates))
+    )
+
+
 def parse_current_readings(payload: object) -> CurrentReadings:
     """Parse the ``current`` block shared by the air-quality and marine APIs.
 
@@ -324,6 +388,7 @@ DRONE_HOURLY_VARIABLES = (
     "cape",
     "freezing_level_height",
     "is_day",
+    "cloud_cover_low",
     "wind_speed_950hPa",
     "wind_speed_925hPa",
     "wind_speed_900hPa",
@@ -382,6 +447,7 @@ def _parse_drone_hour(series: TimeSeries, index: int, elevation_m: float) -> Dro
         cape=_cell(series, "cape", index),
         freezing_level_agl_m=_freezing_level_agl(series, index, elevation_m),
         is_day=None if is_day_value is None else bool(is_day_value),
+        cloud_cover_low_pct=_cell(series, "cloud_cover_low", index),
     )
 
 
@@ -466,3 +532,33 @@ def _require_kp_row(value: object) -> list[object]:
         message = "malformed planetary Kp row"
         raise SpaceWeatherError(message)
     return cast("list[object]", value)
+
+
+def parse_kp_forecast(payload: object) -> tuple[KpForecastEntry, ...]:
+    """Parse the NOAA SWPC 3-day planetary K-index forecast.
+
+    Same array-of-arrays shape as the nowcast: a header row followed by one row
+    per 3-hour bucket (``[time_tag, kp, ...]``) in UTC and chronological order.
+
+    Args:
+        payload: Decoded JSON from the NOAA planetary K-index forecast product.
+
+    Returns:
+        The predicted buckets in chronological order; empty when none are present.
+
+    Raises:
+        SpaceWeatherError: If the payload is not a list or a row is malformed.
+    """
+    if not isinstance(payload, list):
+        not_list_message = "planetary Kp forecast response"
+        raise SpaceWeatherError(not_list_message)
+    rows = cast("list[object]", payload)
+    entries: list[KpForecastEntry] = []
+    for row in rows[1:]:
+        fields = _require_kp_row(row)
+        time_value = fields[0]
+        if not isinstance(time_value, str):
+            time_message = "non-string Kp forecast timestamp"
+            raise SpaceWeatherError(time_message)
+        entries.append(KpForecastEntry(time=time_value, kp=_coerce_kp_value(fields[1])))
+    return tuple(entries)

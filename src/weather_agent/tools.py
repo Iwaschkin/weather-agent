@@ -22,6 +22,7 @@ from weather_agent.weather import (
     pollen_summary,
     river_discharge_summary,
     solar_summary,
+    sun_times_summary,
     uv_index_summary,
     weather_for_date,
 )
@@ -207,6 +208,21 @@ def get_solar_potential(location: str, days: int = 3) -> str:
         explanatory message when the location cannot be resolved.
     """
     return render(solar_summary(location, days))
+
+
+@tool
+def get_sun_times(location: str, days: int = 1) -> str:
+    """Get sunrise, sunset, and daylight length for a named location.
+
+    Args:
+        location: A city or place name, for example "Tromsø" or "Quito".
+        days: Number of days to report (1-16).
+
+    Returns:
+        A day-by-day summary of sunrise, sunset, and daylight hours, or an
+        explanatory message when the location cannot be resolved.
+    """
+    return render(sun_times_summary(location, days))
 
 
 @tool

@@ -13,6 +13,7 @@ from weather_agent.weather import (
     pollen_summary,
     river_discharge_summary,
     solar_summary,
+    sun_times_summary,
     uv_index_summary,
 )
 
@@ -80,6 +81,14 @@ _CURRENT_BODY: dict[str, object] = {
         "temperature_2m": 21.3,
         "wind_speed_10m": 9.7,
         "weather_code": 3,
+    },
+}
+_SUN_BODY: dict[str, object] = {
+    "daily": {
+        "time": ["2026-06-16"],
+        "sunrise": ["2026-06-16T04:43"],
+        "sunset": ["2026-06-16T21:21"],
+        "daylight_duration": [59880.0],
     },
 }
 
@@ -217,6 +226,15 @@ def test_current_weather_at_coordinates_labels_with_coordinates() -> None:
 
     assert "Current weather in 52.5200, 13.4100" in summary
     assert "overcast" in summary
+
+
+def test_sun_times_summary_reports_sunrise_sunset() -> None:
+    """Sun-times summary reports sunrise, sunset, and daylight for the day."""
+    summary = render(sun_times_summary("London", client=_client_for("api.open-meteo", _SUN_BODY)))
+
+    assert "Sun times for Berlin, Germany" in summary
+    assert "sunrise 04:43" in summary
+    assert "sunset 21:21" in summary
 
 
 def test_current_weather_at_coordinates_reports_failure() -> None:

@@ -10,6 +10,8 @@ from weather_agent.drone import DRONE_PROFILES, MINI_5_PRO
 from weather_agent.drone_report import describe_drone_assessment, describe_supported_drones
 from weather_agent.knowledge import KnowledgeSection
 from weather_agent.models import (
+    DayAlmanac,
+    DayOutlook,
     DroneAssessment,
     FlightWindow,
     HourAssessment,
@@ -77,6 +79,37 @@ def test_describe_drone_assessment_includes_all_sections() -> None:
     assert "not legal" in text.lower()
 
 
+def test_describe_drone_assessment_renders_daylight_and_daily_outlook() -> None:
+    """Sun times produce a daylight line and the daily outlook is listed."""
+    assessment = DroneAssessment(
+        drone_name="DJI Mini 5 Pro",
+        place_label="Congleton, England",
+        hours=(HourAssessment("2026-06-16T10:00", Verdict.GOOD, (), 4.0),),
+        best_window=FlightWindow("2026-06-16T10:00", "2026-06-16T10:00", 1),
+        daily=(
+            DayOutlook(
+                date="2026-06-16",
+                good_hours=1,
+                best_window=FlightWindow("2026-06-16T10:00", "2026-06-16T10:00", 1),
+            ),
+        ),
+    )
+    sun_times = (
+        DayAlmanac(
+            date="2026-06-16",
+            sunrise="2026-06-16T04:43",
+            sunset="2026-06-16T21:21",
+            daylight_seconds=59880.0,
+        ),
+    )
+
+    text = describe_drone_assessment(assessment, caa_guidance(MINI_5_PRO), (), sun_times)
+
+    assert "Daylight: sunrise 04:43, sunset 21:21" in text
+    assert "Daily outlook:" in text
+    assert "2026-06-16: 1 good h, best 10:00-10:00" in text
+
+
 def test_describe_drone_assessment_notes_empty_outlook() -> None:
     """When every hour has elapsed, the outlook says so instead of an empty list."""
     assessment = DroneAssessment(
@@ -128,6 +161,48 @@ def test_drone_flight_summary_rejects_unknown_drone() -> None:
 
     assert "Supported drones" in summary
     assert "DJI Mini 5 Pro" in summary
+
+
+def test_drone_flight_summary_applies_per_hour_kp_forecast() -> None:
+    """The Kp forecast varies per hour: a later 3-hour bucket can flag a storm.
+
+    Exercises the UK-local-to-UTC bucket alignment: 10:00 BST -> 09:00 UTC (quiet)
+    is good, while 11:00 BST -> 10:00 UTC (Kp 6) is marginal for geomagnetic risk.
+    """
+    calm_body: dict[str, object] = {
+        "elevation": 120.0,
+        "hourly": {
+            "time": ["2026-06-16T10:00", "2026-06-16T11:00"],
+            "wind_gusts_10m": [12.0, 12.0],
+            "wind_speed_10m": [10.0, 10.0],
+            "temperature_2m": [16.0, 16.0],
+            "precipitation": [0.0, 0.0],
+            "precipitation_probability": [0.0, 0.0],
+            "visibility": [30000.0, 30000.0],
+            "is_day": [1.0, 1.0],
+            "cape": [0.0, 0.0],
+        },
+    }
+    kp_forecast: list[object] = [
+        ["time_tag", "kp", "observed", "noaa_scale"],
+        ["2026-06-16 09:00:00", "2.00", "predicted", None],
+        ["2026-06-16 10:00:00", "6.00", "predicted", None],
+    ]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.host.startswith("geocoding"):
+            return httpx.Response(200, json=_GEOCODE_BODY)
+        if request.url.host == "services.swpc.noaa.gov":
+            return httpx.Response(200, json=kp_forecast)
+        return httpx.Response(200, json=calm_body)
+
+    client = OpenMeteoClient(client=httpx.Client(transport=httpx.MockTransport(handler)))
+
+    summary = render(drone_flight_summary("Congleton UK", "Mini 5 Pro", client=client, now=_NOW))
+
+    assert "2026-06-16T10:00  GOOD" in summary
+    assert "2026-06-16T11:00  MARGINAL" in summary
+    assert "geomagnetic" in summary
 
 
 def test_drone_flight_summary_survives_kp_outage() -> None:

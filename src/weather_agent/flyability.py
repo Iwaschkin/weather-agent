@@ -11,9 +11,11 @@ from __future__ import annotations
 from datetime import datetime
 from typing import TYPE_CHECKING
 
-from weather_agent.models import DroneAssessment, FlightWindow, HourAssessment, Verdict
+from weather_agent.models import DayOutlook, DroneAssessment, FlightWindow, HourAssessment, Verdict
 
 if TYPE_CHECKING:
+    from collections.abc import Mapping
+
     from weather_agent.models import DroneFlightHour, DroneForecast, DroneProfile
 
 _KMH_PER_MS = 3.6
@@ -23,6 +25,9 @@ _KMH_PER_MS = 3.6
 _PRECIP_PROBABILITY_MARGINAL_PCT = 20.0
 _PRECIP_PROBABILITY_NO_FLY_PCT = 50.0
 _VISIBILITY_MARGINAL_M = 5000.0
+# Low-cloud cover is only a proxy for a low cloud base (open-meteo gives no base
+# height); near-overcast low cloud flags a possible low ceiling to check.
+_LOW_CLOUD_MARGINAL_PCT = 90.0
 _CAPE_MARGINAL = 1000.0
 _COLD_CAUTION_C = 5.0
 _ICING_CEILING_M = 500.0
@@ -148,6 +153,16 @@ def _storm_gate(hour: DroneFlightHour) -> _Gate:
     return (Verdict.GOOD, "")
 
 
+def _cloud_gate(hour: DroneFlightHour) -> _Gate:
+    low_cloud = hour.cloud_cover_low_pct
+    if low_cloud is not None and low_cloud >= _LOW_CLOUD_MARGINAL_PCT:
+        return (
+            Verdict.MARGINAL,
+            f"near-overcast low cloud ({low_cloud:.0f}%); check the cloud base stays clear",
+        )
+    return (Verdict.GOOD, "")
+
+
 def _geomagnetic_gate(kp_index: float | None) -> _Gate:
     if kp_index is not None and kp_index >= _KP_CAUTION:
         return (Verdict.MARGINAL, f"geomagnetic storm (Kp {kp_index:.0f}; GPS/compass risk)")
@@ -185,6 +200,7 @@ def assess_hour(
         _icing_gate(hour),
         _daylight_visibility_gate(hour),
         _storm_gate(hour),
+        _cloud_gate(hour),
         _geomagnetic_gate(kp_index),
     )
     worst = max(_SEVERITY[verdict] for verdict, _ in gates)
@@ -221,11 +237,34 @@ def best_window(hours: tuple[HourAssessment, ...]) -> FlightWindow | None:
     return best
 
 
+def daily_outlooks(hours: tuple[HourAssessment, ...]) -> tuple[DayOutlook, ...]:
+    """Summarise per-hour assessments into one outlook per calendar day.
+
+    Args:
+        hours: Per-hour assessments in chronological order.
+
+    Returns:
+        One :class:`DayOutlook` per day present, in chronological order, each with
+        that day's good-hour count and best contiguous good window.
+    """
+    by_date: dict[str, list[HourAssessment]] = {}
+    for hour in hours:
+        by_date.setdefault(hour.time[:10], []).append(hour)
+    return tuple(
+        DayOutlook(
+            date=date,
+            good_hours=sum(1 for hour in day_hours if hour.verdict is Verdict.GOOD),
+            best_window=best_window(tuple(day_hours)),
+        )
+        for date, day_hours in by_date.items()
+    )
+
+
 def assess_forecast(
     profile: DroneProfile,
     forecast: DroneForecast,
     place_label: str,
-    kp_index: float | None = None,
+    kp_by_time: Mapping[str, float] | None = None,
     now: datetime | None = None,
 ) -> DroneAssessment:
     """Assess every hour of a drone forecast and find the best window.
@@ -234,19 +273,24 @@ def assess_forecast(
         profile: The drone's flight limits.
         forecast: The parsed drone forecast.
         place_label: Human-readable location for the assessment.
-        kp_index: The planetary Kp index for the period, or ``None`` when unknown.
+        kp_by_time: Per-hour planetary Kp keyed by the hour's timestamp (so a Kp
+            forecast varies across the window), or ``None`` when unknown.
         now: Current naive local time used to drop already-elapsed hours; when
             ``None`` every forecast hour is assessed.
 
     Returns:
         The full per-hour assessment over the remaining hours, with the best
-        contiguous good window.
+        contiguous good window and a per-day outlook.
     """
     upcoming = _future_hours(forecast.hours, now)
-    hours = tuple(assess_hour(profile, hour, kp_index) for hour in upcoming)
+    hours = tuple(
+        assess_hour(profile, hour, kp_by_time.get(hour.time) if kp_by_time else None)
+        for hour in upcoming
+    )
     return DroneAssessment(
         drone_name=profile.name,
         place_label=place_label,
         hours=hours,
         best_window=best_window(hours),
+        daily=daily_outlooks(hours),
     )

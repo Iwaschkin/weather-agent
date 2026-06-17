@@ -2,7 +2,13 @@
 
 import pytest
 
-from weather_agent.models import CurrentReadings, CurrentWeather, TimeSeries, UvIndex
+from weather_agent.models import (
+    CurrentReadings,
+    CurrentWeather,
+    DayAlmanac,
+    TimeSeries,
+    UvIndex,
+)
 from weather_agent.reporting import (
     describe_comparison,
     describe_current_readings,
@@ -13,7 +19,9 @@ from weather_agent.reporting import (
     describe_latest_values,
     describe_period,
     describe_solar,
+    describe_sun_times,
     describe_uv,
+    format_clock,
 )
 
 
@@ -215,6 +223,44 @@ def test_describe_uv_handles_no_data() -> None:
     uv = UvIndex(time="t", current=None, today_max=None)
 
     assert "No UV data" in describe_uv("Nairobi", uv)
+
+
+@pytest.mark.parametrize(
+    ("iso", "expected"),
+    [
+        ("2026-06-16T04:43", "04:43"),
+        ("2026-06-16T21:21:00", "21:21"),
+        ("2026-06-16", "n/a"),
+        ("", "n/a"),
+    ],
+)
+def test_format_clock(iso: str, expected: str) -> None:
+    """A clock time is extracted from an ISO timestamp, or n/a when absent."""
+    assert format_clock(iso) == expected
+
+
+def test_describe_sun_times_reports_each_day() -> None:
+    """Sun times render sunrise, sunset, and daylight per day."""
+    almanac = (
+        DayAlmanac(
+            date="2026-06-16",
+            sunrise="2026-06-16T04:43",
+            sunset="2026-06-16T21:21",
+            daylight_seconds=59880.0,
+        ),
+    )
+
+    summary = describe_sun_times("London", almanac)
+
+    assert "Sun times for London" in summary
+    assert "sunrise 04:43" in summary
+    assert "sunset 21:21" in summary
+    assert "daylight 16.6 h" in summary
+
+
+def test_describe_sun_times_handles_empty() -> None:
+    """No almanac rows yields an explanatory note."""
+    assert "No sun-time data" in describe_sun_times("London", ())
 
 
 def test_describe_solar_reports_radiation_and_hours() -> None:
