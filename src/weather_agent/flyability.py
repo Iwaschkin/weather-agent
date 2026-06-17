@@ -32,6 +32,14 @@ _CAPE_MARGINAL = 1000.0
 _COLD_CAUTION_C = 5.0
 _ICING_CEILING_M = 500.0
 _KP_CAUTION = 5.0
+# FPV airframes are flown faster and are less forgiving in gusts than the raw wind
+# rating implies, so both gust thresholds are tightened for them (safety-biased).
+_FPV_GUST_FACTOR = 0.85
+# Reduced visibility is riskier without omnidirectional obstacle sensing and safer
+# for a low-light-capable airframe (e.g. LiDAR), so the marginal visibility
+# threshold adapts to the drone's sensing stack.
+_NO_OMNI_VISIBILITY_PENALTY_M = 3000.0
+_LOW_LIGHT_VISIBILITY_BONUS_M = 2000.0
 
 _SEVERITY = {Verdict.GOOD: 0, Verdict.MARGINAL: 1, Verdict.NO_FLY: 2}
 
@@ -86,16 +94,24 @@ def _governing_wind_ms(hour: DroneFlightHour) -> float | None:
     return worst_kmh / _KMH_PER_MS if worst_kmh is not None else None
 
 
+def _effective_gust_limits(profile: DroneProfile) -> tuple[float, float]:
+    """Return (ideal, caution) gust limits, tightened for FPV airframes."""
+    factor = _FPV_GUST_FACTOR if profile.is_fpv else 1.0
+    return profile.ideal_gust_ms * factor, profile.caution_gust_ms * factor
+
+
 def _wind_gate(profile: DroneProfile, governing_ms: float | None) -> _Gate:
     if governing_ms is None:
         return (Verdict.MARGINAL, "wind data unavailable")
-    if governing_ms > profile.caution_gust_ms:
+    ideal, caution = _effective_gust_limits(profile)
+    fpv = " (FPV: reduced gust margin)" if profile.is_fpv else ""
+    if governing_ms > caution:
         return (
             Verdict.NO_FLY,
-            f"gusts ~{governing_ms:.0f} m/s exceed the {profile.caution_gust_ms:.0f} m/s limit",
+            f"gusts ~{governing_ms:.0f} m/s exceed the {caution:.0f} m/s limit{fpv}",
         )
-    if governing_ms > profile.ideal_gust_ms:
-        return (Verdict.MARGINAL, f"gusts ~{governing_ms:.0f} m/s near the wind limit")
+    if governing_ms > ideal:
+        return (Verdict.MARGINAL, f"gusts ~{governing_ms:.0f} m/s near the wind limit{fpv}")
     return (Verdict.GOOD, "")
 
 
@@ -138,11 +154,21 @@ def _icing_gate(hour: DroneFlightHour) -> _Gate:
     return (Verdict.GOOD, "")
 
 
-def _daylight_visibility_gate(hour: DroneFlightHour) -> _Gate:
+def _visibility_threshold(profile: DroneProfile) -> float:
+    """Visibility (m) below which the hour is marginal, adapted to the drone's sensing."""
+    threshold = _VISIBILITY_MARGINAL_M
+    if not profile.has_omni_sensing:
+        threshold += _NO_OMNI_VISIBILITY_PENALTY_M
+    if profile.low_light_capable:
+        threshold -= _LOW_LIGHT_VISIBILITY_BONUS_M
+    return threshold
+
+
+def _daylight_visibility_gate(profile: DroneProfile, hour: DroneFlightHour) -> _Gate:
     if hour.is_day is False:
         return (Verdict.NO_FLY, "night-time (outside daylight visual line of sight)")
     visibility = hour.visibility_m
-    if visibility is not None and visibility < _VISIBILITY_MARGINAL_M:
+    if visibility is not None and visibility < _visibility_threshold(profile):
         return (Verdict.MARGINAL, f"reduced visibility ({visibility / 1000:.0f} km)")
     return (Verdict.GOOD, "")
 
@@ -198,7 +224,7 @@ def assess_hour(
         _precipitation_gate(hour),
         _temperature_gate(profile, hour),
         _icing_gate(hour),
-        _daylight_visibility_gate(hour),
+        _daylight_visibility_gate(profile, hour),
         _storm_gate(hour),
         _cloud_gate(hour),
         _geomagnetic_gate(kp_index),

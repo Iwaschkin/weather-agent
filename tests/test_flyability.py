@@ -150,6 +150,31 @@ def test_assess_hour_no_icing_when_freezing_level_high() -> None:
     assert result.verdict is Verdict.GOOD
 
 
+def test_assess_hour_fpv_tightens_gust_margin() -> None:
+    """An FPV airframe goes no-fly at a gust its raw rating would only call marginal."""
+    # ~9.5 m/s: below the Avata 2's 10.7 m/s rating, above its FPV-adjusted 9.1 m/s.
+    windy = replace(_GOOD_HOUR, wind_gust_10m_kmh=34.2, wind_max_0_500m_kmh=34.2)
+
+    fpv = assess_hour(AVATA_2, windy)
+    non_fpv = assess_hour(replace(AVATA_2, is_fpv=False), windy)
+
+    assert fpv.verdict is Verdict.NO_FLY
+    assert any("FPV" in factor for factor in fpv.limiting_factors)
+    assert non_fpv.verdict is Verdict.MARGINAL
+
+
+def test_assess_hour_visibility_threshold_adapts_to_sensing() -> None:
+    """Reduced visibility is marginal without omni sensing but fine for a LiDAR drone."""
+    hazy = replace(_GOOD_HOUR, visibility_m=6000.0)  # daytime, 6 km
+
+    neo = assess_hour(NEO, hazy)  # no omni, not low-light -> 8 km threshold
+    mini = assess_hour(MINI_5_PRO, hazy)  # omni + low-light -> 3 km threshold
+
+    assert neo.verdict is Verdict.MARGINAL
+    assert any("visibility" in factor for factor in neo.limiting_factors)
+    assert mini.verdict is Verdict.GOOD
+
+
 def test_assess_hour_marginal_on_low_cloud() -> None:
     """Near-overcast low cloud flags a possible low ceiling to check."""
     cloudy = replace(_GOOD_HOUR, cloud_cover_low_pct=95.0)
