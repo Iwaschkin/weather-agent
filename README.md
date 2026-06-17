@@ -1,8 +1,10 @@
 # weather-agent
 
 A [Strands](https://github.com/strands-agents/sdk-python) agent that answers
-weather, climate, and environmental questions using the free
-[open-meteo.com](https://open-meteo.com) APIs. No API key is needed.
+weather, climate, and environmental questions, primarily using the free
+[open-meteo.com](https://open-meteo.com) APIs (no key needed). It also draws on
+NOAA space weather and aviationweather.gov (both key-free); only the airspace tool
+needs a key (see [Configuration](#configuration)).
 
 It is a technical demonstrator: open-meteo is really several APIs that share one
 request/response grammar, so each capability is one Strands tool built on a single
@@ -18,13 +20,24 @@ shared time-series boundary (`TimeSeries` + `parse_time_series`).
 | `get_climate_projection` | Climate (CMIP6) | Decade-scale projections to 2050 |
 | `get_weather` | routed | Picks archive/forecast/climate by date |
 | `compare_weather` | Archive | Compare two historical date ranges |
-| `get_air_quality` | Air-Quality | PM2.5, PM10, ozone, European AQI |
-| `get_marine_forecast` | Marine | Wave height and period (coastal) |
+| `get_weather_at_coordinates` | Forecast | Current conditions at a raw latitude/longitude (no geocoding) |
+| `get_air_quality` | Air-Quality | PM2.5, PM10, ozone, European AQI (current hour) |
+| `get_pollen` | Air-Quality (CAMS) | Grass, tree, and weed pollen (Europe) |
+| `get_marine_forecast` | Marine | Wave height and period (coastal, current hour) |
 | `get_river_discharge` | Flood (GloFAS) | River discharge / flood indicator |
 | `get_ensemble_forecast` | Ensemble | Member spread (forecast uncertainty) |
+| `get_uv_index` | Forecast | UV index now and today's peak, with WHO risk bands |
+| `get_solar_potential` | Forecast | Daily solar radiation, sunshine, and daylight |
+| `get_sun_times` | Forecast | Sunrise, sunset, and daylight length |
+| `get_aviation_weather` | aviationweather.gov | Nearest airport's observed METAR (wind, visibility, ceiling) |
+| `get_airspace` | OpenAIP (key) | Nearby controlled/restricted airspace (decision support) |
 | `get_elevation` | Elevation | Terrain height |
-| `assess_drone_conditions` | Forecast + NOAA Kp | Per-hour drone flyability (DJI Neo, Avata 2, Mini 5 Pro) with UK CAA notes |
+| `assess_drone_conditions` | Forecast + NOAA Kp + METAR + OpenAIP | Per-hour drone flyability (DJI Neo, Avata 2, Mini 5 Pro) with UK CAA notes |
 | `list_supported_drones` | (none) | The drone models the assessor covers |
+
+Current conditions name the WMO condition (e.g. "light rain") and include humidity,
+dew point, cloud cover, and pressure; the daily forecast adds rain chance and peak
+gust.
 
 ## Drone flying assessment
 
@@ -32,21 +45,28 @@ shared time-series boundary (`TimeSeries` + `parse_time_series`).
 deterministic rules engine plus a small retrieved knowledge file. It combines a
 drone-tuned hourly forecast (gusts and winds up to 500 m above ground, derived
 from fixed-height and pressure-level winds), precipitation, temperature,
-visibility, daylight, thunderstorm potential (CAPE), and NOAA's planetary Kp
-index into an hour-by-hour `GOOD` / `MARGINAL` / `NO-FLY` verdict for a chosen
-drone, names the limiting factor, finds the best flying window, and adds UK CAA
-open-category guidance plus matching tips.
+visibility, daylight, low-cloud cover, thunderstorm potential (CAPE), and NOAA's
+per-hour planetary Kp forecast into an hour-by-hour `GOOD` / `MARGINAL` /
+`NO-FLY` verdict for a chosen drone, names the limiting factor, finds the best
+flying window, and summarises a per-day outlook over a multi-day horizon. It adds
+UK CAA open-category guidance, the day's sunrise/sunset window, the nearest
+airport's observed METAR (a reality check on the model), and nearby airspace from
+OpenAIP, plus matching tips.
 
-It is decision support, not legal or airworthiness advice: it does **not** check
-airspace, Flight Restriction Zones, or NOTAMs - use CAA Drone Assist / Altitude
-Angel for those. Edit `src/weather_agent/data/drone_knowledge.md` to tune the
-qualitative tips.
+It is decision support, not legal or airworthiness advice. The airspace section is
+**not** authoritative and does **not** cover NOTAMs - always verify with CAA Drone
+Assist / Altitude Angel before flying. The airspace lookup needs an OpenAIP key
+(see Configuration); without one, every other part still works. Edit
+`src/weather_agent/data/drone_knowledge.md` to tune the qualitative tips.
 
 ## Layout
 
 - `weather_agent.models` — typed value objects (`TimeSeries`, request and result types).
-- `weather_agent.parsing` — pure parsers that validate open-meteo JSON into typed models.
-- `weather_agent.client` — the only module that performs HTTP I/O (`OpenMeteoClient`).
+- `weather_agent.parsing` — pure parsers that validate open-meteo, NOAA, aviation, and OpenAIP JSON into typed models.
+- `weather_agent.weather_codes` — WMO weather-code to human-readable condition lookup.
+- `weather_agent.client` — HTTP I/O for the open-meteo and NOAA endpoints (`OpenMeteoClient`).
+- `weather_agent.aviation` — HTTP boundary for aviationweather.gov METARs (`AviationClient`).
+- `weather_agent.openaip` — HTTP boundary for OpenAIP airspace (`OpenAipClient`, needs a key).
 - `weather_agent.reporting` — pure formatting of time series into readable summaries.
 - `weather_agent.routing` — pure date-based selection of the right data source.
 - `weather_agent.drone` — drone model profiles (DJI Neo, Avata 2, Mini 5 Pro) and lookup.
