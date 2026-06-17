@@ -3,12 +3,14 @@
 import pytest
 
 from weather_agent.parsing import (
+    AviationError,
     OpenMeteoError,
     parse_current_readings,
     parse_current_weather,
     parse_daily_almanac,
     parse_elevation,
     parse_geocode_results,
+    parse_metars,
     parse_time_series,
     parse_uv_index,
 )
@@ -166,6 +168,45 @@ def test_parse_current_weather_optional_fields_default_none() -> None:
 
     assert weather.weather_code is None
     assert weather.surface_pressure_hpa is None
+
+
+def test_parse_metars_extracts_fields_and_ceiling() -> None:
+    """METAR parsing reads wind/visibility/clouds and derives the ceiling."""
+    payload: list[object] = [
+        {
+            "icaoId": "EGCC",
+            "lat": 53.35,
+            "lon": -2.28,
+            "reportTime": "2026-06-16 12:00:00",
+            "wdir": 240,
+            "wspd": 12,
+            "wgst": 20,
+            "visib": "10+",
+            "clouds": [{"cover": "SCT", "base": 1800}, {"cover": "OVC", "base": 2500}],
+            "rawOb": "EGCC 161200Z 24012G20KT",
+        },
+    ]
+
+    reports = parse_metars(payload)
+
+    assert reports[0].station == "EGCC"
+    assert reports[0].visibility_sm == 10.0
+    assert reports[0].wind_gust_kt == 20.0
+    # Ceiling is the lowest BKN/OVC layer (OVC 2500), not the SCT layer.
+    assert reports[0].ceiling_ft_agl == 2500.0
+
+
+def test_parse_metars_skips_entries_without_coordinates() -> None:
+    """Entries missing an id or coordinates are skipped, not fatal."""
+    payload: list[object] = [{"icaoId": "EGCC"}, "junk", {"lat": 1.0, "lon": 2.0}]
+
+    assert parse_metars(payload) == ()
+
+
+def test_parse_metars_rejects_non_list() -> None:
+    """A non-array METAR payload raises an aviation error."""
+    with pytest.raises(AviationError):
+        _ = parse_metars({"not": "a list"})
 
 
 def test_parse_daily_almanac_reads_sun_times() -> None:

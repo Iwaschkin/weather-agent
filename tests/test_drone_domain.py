@@ -4,6 +4,7 @@ from datetime import datetime
 
 import httpx
 
+from weather_agent.aviation import AviationClient
 from weather_agent.caa import caa_guidance
 from weather_agent.client import OpenMeteoClient
 from weather_agent.drone import DRONE_PROFILES, MINI_5_PRO
@@ -15,10 +16,11 @@ from weather_agent.models import (
     DroneAssessment,
     FlightWindow,
     HourAssessment,
+    SiteBriefing,
     Verdict,
 )
 from weather_agent.results import render
-from weather_agent.weather import drone_flight_summary
+from weather_agent.weather import SiteClients, drone_flight_summary
 
 # Fixed reference time so the fixture's 10:00/11:00 hours are never filtered as past.
 _NOW = datetime(2026, 6, 16, 9, 0)  # noqa: DTZ001
@@ -54,6 +56,29 @@ _KP_BODY: list[object] = [
     ["time_tag", "Kp"],
     ["2026-06-16 09:00:00", "2"],
 ]
+_METAR_BODY: list[object] = [
+    {
+        "icaoId": "EGCC",
+        "lat": 53.35,
+        "lon": -2.28,
+        "reportTime": "2026-06-16 09:00:00",
+        "wdir": 240,
+        "wspd": 8,
+        "clouds": [{"cover": "FEW", "base": 4000}],
+        "rawOb": "EGCC 160900Z 24008KT",
+    },
+]
+
+
+def _aviation(body: object) -> AviationClient:
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=body)
+
+    return AviationClient(client=httpx.Client(transport=httpx.MockTransport(handler)))
+
+
+def _site_clients(metar_body: object) -> SiteClients:
+    return SiteClients(aviation=_aviation(metar_body))
 
 
 def test_describe_drone_assessment_includes_all_sections() -> None:
@@ -103,7 +128,9 @@ def test_describe_drone_assessment_renders_daylight_and_daily_outlook() -> None:
         ),
     )
 
-    text = describe_drone_assessment(assessment, caa_guidance(MINI_5_PRO), (), sun_times)
+    text = describe_drone_assessment(
+        assessment, caa_guidance(MINI_5_PRO), (), SiteBriefing(sun_times=sun_times)
+    )
 
     assert "Daylight: sunrise 04:43, sunset 21:21" in text
     assert "Daily outlook:" in text
@@ -145,14 +172,22 @@ def _drone_client() -> OpenMeteoClient:
 
 
 def test_drone_flight_summary_assesses_known_drone() -> None:
-    """A known drone at a resolvable place yields a full assessment."""
+    """A known drone at a resolvable place yields a full assessment with METAR."""
     summary = render(
-        drone_flight_summary("Congleton UK", "Mini 5 Pro", client=_drone_client(), now=_NOW)
+        drone_flight_summary(
+            "Congleton UK",
+            "Mini 5 Pro",
+            client=_drone_client(),
+            now=_NOW,
+            site_clients=_site_clients(_METAR_BODY),
+        )
     )
 
     assert "DJI Mini 5 Pro at Congleton, England" in summary
     assert "Hourly outlook" in summary
     assert "UK CAA notes" in summary
+    assert "Nearest METAR" in summary
+    assert "EGCC" in summary
 
 
 def test_drone_flight_summary_rejects_unknown_drone() -> None:
@@ -198,7 +233,15 @@ def test_drone_flight_summary_applies_per_hour_kp_forecast() -> None:
 
     client = OpenMeteoClient(client=httpx.Client(transport=httpx.MockTransport(handler)))
 
-    summary = render(drone_flight_summary("Congleton UK", "Mini 5 Pro", client=client, now=_NOW))
+    summary = render(
+        drone_flight_summary(
+            "Congleton UK",
+            "Mini 5 Pro",
+            client=client,
+            now=_NOW,
+            site_clients=_site_clients([]),
+        )
+    )
 
     assert "2026-06-16T10:00  GOOD" in summary
     assert "2026-06-16T11:00  MARGINAL" in summary
@@ -217,6 +260,10 @@ def test_drone_flight_summary_survives_kp_outage() -> None:
 
     client = OpenMeteoClient(client=httpx.Client(transport=httpx.MockTransport(handler)))
 
-    summary = render(drone_flight_summary("Congleton UK", "Neo", client=client, now=_NOW))
+    summary = render(
+        drone_flight_summary(
+            "Congleton UK", "Neo", client=client, now=_NOW, site_clients=_site_clients([])
+        )
+    )
 
     assert "DJI Neo at Congleton, England" in summary

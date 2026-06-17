@@ -10,12 +10,14 @@ callers can compose outcomes safely. The tool layer renders the outcome to text.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import UTC, date, datetime
 from typing import TYPE_CHECKING
 from zoneinfo import ZoneInfo
 
 import httpx
 
+from weather_agent.aviation import AviationClient
 from weather_agent.caa import caa_guidance
 from weather_agent.client import OpenMeteoClient
 from weather_agent.drone import DRONE_PROFILES, find_profile
@@ -23,8 +25,8 @@ from weather_agent.drone_report import describe_drone_assessment, describe_suppo
 from weather_agent.flyability import assess_forecast
 from weather_agent.geocoding import parse_location, select_best_match
 from weather_agent.knowledge import load_sections, retrieve
-from weather_agent.models import ClimateRequest, HistoricalRequest
-from weather_agent.parsing import OpenMeteoError, SpaceWeatherError
+from weather_agent.models import ClimateRequest, HistoricalRequest, SiteBriefing
+from weather_agent.parsing import ExternalDataError, OpenMeteoError, SpaceWeatherError
 from weather_agent.reporting import (
     DAILY_VARIABLES,
     FORECAST_DAILY_VARIABLES,
@@ -36,6 +38,7 @@ from weather_agent.reporting import (
     describe_ensemble_spread,
     describe_forecast_day,
     describe_latest_values,
+    describe_metar,
     describe_period,
     describe_solar,
     describe_sun_times,
@@ -47,7 +50,13 @@ from weather_agent.routing import FORECAST_HORIZON_DAYS, DataSource, select_data
 if TYPE_CHECKING:
     from collections.abc import Callable
 
-    from weather_agent.models import DayAlmanac, DroneFlightHour, GeocodeResult, KpForecastEntry
+    from weather_agent.models import (
+        DayAlmanac,
+        DroneFlightHour,
+        GeocodeResult,
+        KpForecastEntry,
+        MetarReport,
+    )
 
 _DEFAULT_CLIMATE_MODEL = "EC_Earth3P_HR"
 _DEFAULT_ENSEMBLE_MODEL = "icon_seamless"
@@ -112,7 +121,7 @@ def _summarize(
         if place is None:
             return NotFound(location)
         return Answer(describe(active, place))
-    except (httpx.HTTPError, OpenMeteoError) as error:
+    except (httpx.HTTPError, ExternalDataError) as error:
         return Failed(location, str(error))
     finally:
         if owns_client:
@@ -507,6 +516,39 @@ def current_weather_at_coordinates(
             active.close()
 
 
+def aviation_summary(
+    location: str,
+    client: OpenMeteoClient | None = None,
+    aviation_client: AviationClient | None = None,
+) -> LookupOutcome:
+    """Build an observed-conditions (nearest METAR) summary for a named location.
+
+    Args:
+        location: A city or place name.
+        client: Optional open-meteo client (used for geocoding).
+        aviation_client: Optional aviation client; created and closed here when not
+            provided.
+
+    Returns:
+        An outcome wrapping the nearest station's observed wind, visibility, and
+        ceiling, or a note when no station reports nearby.
+    """
+    owns_aviation = aviation_client is None
+    aviation = aviation_client if aviation_client is not None else AviationClient()
+    try:
+
+        def describe(_active: OpenMeteoClient, place: GeocodeResult) -> str:
+            report = aviation.nearest_metar(place.latitude, place.longitude)
+            if report is None:
+                return f"No aviation weather station was found near {_place_label(place)}."
+            return describe_metar(_place_label(place), report)
+
+        return _summarize(location, client, describe)
+    finally:
+        if owns_aviation:
+            aviation.close()
+
+
 def weather_for_date(
     location: str,
     when: str,
@@ -600,6 +642,21 @@ _DRONE_FORECAST_DAYS = 5
 _UK_TIMEZONE = ZoneInfo("Europe/London")
 
 
+@dataclass(frozen=True, slots=True)
+class SiteClients:
+    """Optional injected boundary clients for the drone briefing's extra sources.
+
+    Lets tests pass mock-transport clients for the aviation (and airspace) lookups
+    without widening :func:`drone_flight_summary`'s signature. A ``None`` field
+    means "create one internally for the call and close it afterwards".
+
+    Attributes:
+        aviation: Client for nearest-METAR observations.
+    """
+
+    aviation: AviationClient | None = None
+
+
 def _best_effort_kp(client: OpenMeteoClient) -> float | None:
     """Fetch the latest planetary Kp, returning None on any failure.
 
@@ -633,8 +690,24 @@ def _best_effort_almanac(
     """Fetch sun times for the assessment window, returning () on any failure."""
     try:
         return client.daily_almanac(latitude, longitude, _DRONE_FORECAST_DAYS)
-    except (httpx.HTTPError, OpenMeteoError):
+    except httpx.HTTPError:
         return ()
+    except OpenMeteoError:
+        return ()
+
+
+def _best_effort_metar(
+    aviation: AviationClient,
+    latitude: float,
+    longitude: float,
+) -> MetarReport | None:
+    """Fetch the nearest METAR, returning None on any failure (non-essential)."""
+    try:
+        return aviation.nearest_metar(latitude, longitude)
+    except httpx.HTTPError:
+        return None
+    except ExternalDataError:
+        return None
 
 
 def _kp_buckets(entries: tuple[KpForecastEntry, ...]) -> list[tuple[datetime, float]]:
@@ -703,6 +776,7 @@ def drone_flight_summary(
     drone: str,
     client: OpenMeteoClient | None = None,
     now: datetime | None = None,
+    site_clients: SiteClients | None = None,
 ) -> LookupOutcome:
     """Assess flying a named drone at a location and return readable guidance.
 
@@ -720,6 +794,8 @@ def drone_flight_summary(
         client: Optional client to use.
         now: Current naive UK-local time; defaults to the actual current time.
             Hours before this are excluded so the outlook starts from now.
+        site_clients: Optional injected aviation/airspace clients (tests pass
+            mocks); created internally and closed afterwards when omitted.
 
     Returns:
         An outcome wrapping a full flight assessment, or - for an unrecognised
@@ -729,14 +805,24 @@ def drone_flight_summary(
     if profile is None:
         return Answer(describe_supported_drones(DRONE_PROFILES))
     reference = now if now is not None else datetime.now(_UK_TIMEZONE).replace(tzinfo=None)
+    site = site_clients if site_clients is not None else SiteClients()
+    owns_aviation = site.aviation is None
+    aviation = site.aviation if site.aviation is not None else AviationClient()
 
     def describe(active: OpenMeteoClient, place: GeocodeResult) -> str:
         forecast = active.drone_forecast(place.latitude, place.longitude, _DRONE_FORECAST_DAYS)
         kp_by_time = _drone_kp_by_hour(active, forecast.hours)
-        sun_times = _best_effort_almanac(active, place.latitude, place.longitude)
+        briefing = SiteBriefing(
+            sun_times=_best_effort_almanac(active, place.latitude, place.longitude),
+            metar=_best_effort_metar(aviation, place.latitude, place.longitude),
+        )
         assessment = assess_forecast(profile, forecast, _place_label(place), kp_by_time, reference)
         factors = " ".join(factor for hour in assessment.hours for factor in hour.limiting_factors)
         tips = retrieve(factors or "pre-flight wind battery", load_sections())
-        return describe_drone_assessment(assessment, caa_guidance(profile), tips, sun_times)
+        return describe_drone_assessment(assessment, caa_guidance(profile), tips, briefing)
 
-    return _summarize(location, client, describe)
+    try:
+        return _summarize(location, client, describe)
+    finally:
+        if owns_aviation:
+            aviation.close()

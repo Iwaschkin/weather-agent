@@ -9,6 +9,7 @@ from weather_agent.drone_report import describe_supported_drones
 from weather_agent.results import render
 from weather_agent.weather import (
     air_quality_summary,
+    aviation_summary,
     climate_summary,
     compare_periods,
     current_weather_at_coordinates,
@@ -208,6 +209,24 @@ def get_solar_potential(location: str, days: int = 3) -> str:
         explanatory message when the location cannot be resolved.
     """
     return render(solar_summary(location, days))
+
+
+@tool
+def get_aviation_weather(location: str) -> str:
+    """Get the nearest airport's observed weather (METAR) for a location.
+
+    Reports real observed wind, visibility, and cloud ceiling from the closest
+    reporting station - a reality check against the model forecast, useful for
+    flying.
+
+    Args:
+        location: A city or place name, for example "Manchester".
+
+    Returns:
+        A summary of the nearest station's observed conditions, or an explanatory
+        message when none is found or the location cannot be resolved.
+    """
+    return render(aviation_summary(location))
 
 
 @tool

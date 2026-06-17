@@ -8,8 +8,8 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from weather_agent.models import Verdict
-from weather_agent.reporting import format_clock
+from weather_agent.models import SiteBriefing, Verdict
+from weather_agent.reporting import describe_airspace, describe_metar, format_clock
 
 if TYPE_CHECKING:
     from weather_agent.drone import DroneProfile
@@ -45,6 +45,15 @@ def _render_daylight(sun_times: tuple[DayAlmanac, ...]) -> list[str]:
         f"Daylight: sunrise {format_clock(today.sunrise)}, "
         f"sunset {format_clock(today.sunset)} - keep within daylight for visual line of sight."
     ]
+
+
+def _render_briefing(place_label: str, briefing: SiteBriefing) -> list[str]:
+    lines = list(_render_daylight(briefing.sun_times))
+    if briefing.metar is not None:
+        lines.append(describe_metar(place_label, briefing.metar))
+    if briefing.airspace or briefing.airspace_note:
+        lines.append(describe_airspace(place_label, briefing.airspace, briefing.airspace_note))
+    return lines
 
 
 def _render_hour(hour: HourAssessment) -> str:
@@ -100,7 +109,7 @@ def describe_drone_assessment(
     assessment: DroneAssessment,
     guidance: CaaGuidance,
     tips: tuple[KnowledgeSection, ...],
-    sun_times: tuple[DayAlmanac, ...] = (),
+    briefing: SiteBriefing | None = None,
     max_hours: int = _DEFAULT_MAX_HOURS,
 ) -> str:
     """Render a full drone flight assessment as operator-facing text.
@@ -109,18 +118,20 @@ def describe_drone_assessment(
         assessment: The per-hour flyability assessment.
         guidance: UK CAA guidance for the drone.
         tips: Retrieved qualitative knowledge sections (may be empty).
-        sun_times: Optional daily sun times; when present, today's sunrise/sunset
-            are shown as the daylight window for visual line of sight.
+        briefing: Optional environmental context (sun times, observed METAR, nearby
+            airspace); omitted sections are simply not shown.
         max_hours: Maximum number of hours to list.
 
     Returns:
         A multi-section summary ending with the CAA disclaimer.
     """
+    if briefing is None:
+        briefing = SiteBriefing()
     lines = [
         f"Drone flight assessment - {assessment.drone_name} at {assessment.place_label}",
         "",
         _render_best_window(assessment.best_window),
-        *_render_daylight(sun_times),
+        *_render_briefing(assessment.place_label, briefing),
         "",
         *_render_hours(assessment.hours, max_hours),
     ]

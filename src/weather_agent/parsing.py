@@ -8,6 +8,8 @@ perform no I/O and are safe to unit test without network access.
 from typing import cast
 
 from weather_agent.models import (
+    Airspace,
+    CloudLayer,
     CurrentReadings,
     CurrentWeather,
     DayAlmanac,
@@ -17,6 +19,7 @@ from weather_agent.models import (
     GeocodeResult,
     KpForecastEntry,
     KpIndex,
+    MetarReport,
     TimeSeries,
     UvIndex,
 )
@@ -25,7 +28,15 @@ from weather_agent.models import (
 _CURRENT_META_KEYS = frozenset({"time", "interval"})
 
 
-class OpenMeteoError(RuntimeError):
+class ExternalDataError(RuntimeError):
+    """Base for "a third-party payload was missing or malformed" errors.
+
+    Lets boundaries catch every external-payload failure (open-meteo, NOAA,
+    aviation, OpenAIP) with one type while keeping a specific subclass per source.
+    """
+
+
+class OpenMeteoError(ExternalDataError):
     """Raised when an open-meteo payload is missing or has an unexpected shape."""
 
     def __init__(self, context: str) -> None:
@@ -37,7 +48,7 @@ class OpenMeteoError(RuntimeError):
         super().__init__(f"Malformed open-meteo payload: {context}")
 
 
-class SpaceWeatherError(RuntimeError):
+class SpaceWeatherError(ExternalDataError):
     """Raised when a NOAA SWPC payload is missing or has an unexpected shape."""
 
     def __init__(self, context: str) -> None:
@@ -47,6 +58,30 @@ class SpaceWeatherError(RuntimeError):
             context: Short description of the field or row that was invalid.
         """
         super().__init__(f"Malformed space-weather payload: {context}")
+
+
+class AviationError(ExternalDataError):
+    """Raised when an aviationweather.gov payload is missing or malformed."""
+
+    def __init__(self, context: str) -> None:
+        """Build an error naming the payload location that failed validation.
+
+        Args:
+            context: Short description of the field or block that was invalid.
+        """
+        super().__init__(f"Malformed aviation-weather payload: {context}")
+
+
+class AirspaceError(ExternalDataError):
+    """Raised when an OpenAIP airspace payload is missing or malformed."""
+
+    def __init__(self, context: str) -> None:
+        """Build an error naming the payload location that failed validation.
+
+        Args:
+            context: Short description of the field or block that was invalid.
+        """
+        super().__init__(f"Malformed OpenAIP payload: {context}")
 
 
 def _require_mapping(value: object, context: str) -> dict[str, object]:
@@ -562,3 +597,211 @@ def parse_kp_forecast(payload: object) -> tuple[KpForecastEntry, ...]:
             raise SpaceWeatherError(time_message)
         entries.append(KpForecastEntry(time=time_value, kp=_coerce_kp_value(fields[1])))
     return tuple(entries)
+
+
+def _lenient_float(value: object) -> float | None:
+    # Aviation fields arrive as numbers or strings (for example visibility "10+",
+    # wind direction "VRB"); coerce numerics, salvage trailing-"+" strings.
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        try:
+            return float(value.strip().rstrip("+"))
+        except ValueError:
+            return None
+    return None
+
+
+def _cloud_layers(raw: object) -> tuple[CloudLayer, ...]:
+    if not isinstance(raw, list):
+        return ()
+    layers: list[CloudLayer] = []
+    for item in cast("list[object]", raw):
+        if not isinstance(item, dict):
+            continue
+        mapping = cast("dict[str, object]", item)
+        cover = mapping.get("cover")
+        if isinstance(cover, str):
+            layers.append(CloudLayer(cover=cover, base_ft_agl=_lenient_float(mapping.get("base"))))
+    return tuple(layers)
+
+
+_CEILING_COVERS = frozenset({"BKN", "OVC", "OVX"})
+
+
+def _ceiling_ft(layers: tuple[CloudLayer, ...]) -> float | None:
+    bases = [
+        layer.base_ft_agl
+        for layer in layers
+        if layer.cover in _CEILING_COVERS and layer.base_ft_agl is not None
+    ]
+    return min(bases) if bases else None
+
+
+def _metar_from(mapping: dict[str, object]) -> MetarReport | None:
+    station = mapping.get("icaoId")
+    latitude = _lenient_float(mapping.get("lat"))
+    longitude = _lenient_float(mapping.get("lon"))
+    if not isinstance(station, str) or latitude is None or longitude is None:
+        return None
+    layers = _cloud_layers(mapping.get("clouds"))
+    observed = mapping.get("reportTime")
+    raw = mapping.get("rawOb")
+    return MetarReport(
+        station=station,
+        latitude=latitude,
+        longitude=longitude,
+        observed=observed if isinstance(observed, str) else "",
+        wind_dir_deg=_lenient_float(mapping.get("wdir")),
+        wind_speed_kt=_lenient_float(mapping.get("wspd")),
+        wind_gust_kt=_lenient_float(mapping.get("wgst")),
+        visibility_sm=_lenient_float(mapping.get("visib")),
+        clouds=layers,
+        ceiling_ft_agl=_ceiling_ft(layers),
+        raw=raw if isinstance(raw, str) else "",
+    )
+
+
+def parse_metars(payload: object) -> tuple[MetarReport, ...]:
+    """Parse an aviationweather.gov METAR (JSON) payload into typed reports.
+
+    Lenient by design: the API returns a JSON array of station observations with
+    mixed numeric/string fields; entries missing an id or coordinates are skipped
+    rather than failing the whole batch.
+
+    Args:
+        payload: Decoded JSON from the METAR endpoint (``format=json``).
+
+    Returns:
+        The parsed reports (possibly empty).
+
+    Raises:
+        AviationError: If the payload is not a JSON array.
+    """
+    if not isinstance(payload, list):
+        not_list_message = "metar response"
+        raise AviationError(not_list_message)
+    reports: list[MetarReport] = []
+    for entry in cast("list[object]", payload):
+        if isinstance(entry, dict):
+            report = _metar_from(cast("dict[str, object]", entry))
+            if report is not None:
+                reports.append(report)
+    return tuple(reports)
+
+
+# OpenAIP numeric enums (from the Core API schema), mapped to short labels.
+_AIRSPACE_TYPE_LABELS: dict[int, str] = {
+    0: "Other",
+    1: "Restricted",
+    2: "Danger",
+    3: "Prohibited",
+    4: "CTR",
+    5: "TMZ",
+    6: "RMZ",
+    7: "TMA",
+    8: "TRA",
+    9: "TSA",
+    10: "FIR",
+    11: "UIR",
+    12: "ADIZ",
+    13: "ATZ",
+    14: "MATZ",
+    15: "Airway",
+    16: "MTR",
+    17: "Alert Area",
+    18: "Warning Area",
+    19: "Protected Area",
+    20: "HTZ",
+    21: "Gliding Sector",
+    22: "TRP",
+    23: "TIZ",
+    24: "TIA",
+    25: "MTA",
+    26: "CTA",
+    27: "ACC Sector",
+    28: "Sporting/Recreational",
+    29: "Low Altitude Overflight Restriction",
+    30: "MRT",
+    31: "TFR",
+    32: "VFR Sector",
+    33: "FIS Sector",
+    34: "LTA",
+    35: "UTA",
+    36: "MCTR",
+}
+_ICAO_CLASS_LABELS: dict[int, str] = {
+    0: "A",
+    1: "B",
+    2: "C",
+    3: "D",
+    4: "E",
+    5: "F",
+    6: "G",
+    8: "SUA",
+}
+_AIRSPACE_LIMIT_UNITS: dict[int, str] = {0: "m", 1: "ft", 6: "FL"}
+_AIRSPACE_LIMIT_DATUMS: dict[int, str] = {0: "GND", 1: "MSL", 2: "STD"}
+
+
+def _limit_label(raw: object) -> str:
+    if not isinstance(raw, dict):
+        return ""
+    mapping = cast("dict[str, object]", raw)
+    value = mapping.get("value")
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return ""
+    unit_code = mapping.get("unit")
+    datum_code = mapping.get("referenceDatum")
+    unit = _AIRSPACE_LIMIT_UNITS.get(unit_code, "") if isinstance(unit_code, int) else ""
+    datum = _AIRSPACE_LIMIT_DATUMS.get(datum_code, "") if isinstance(datum_code, int) else ""
+    if value == 0 and datum == "GND":
+        return "GND"
+    return " ".join(part for part in (f"{value:.0f}", unit, datum) if part)
+
+
+def _airspace_from(mapping: dict[str, object]) -> Airspace | None:
+    name = mapping.get("name")
+    if not isinstance(name, str):
+        return None
+    type_code = mapping.get("type")
+    icao_code = mapping.get("icaoClass")
+    return Airspace(
+        name=name,
+        type_label=_AIRSPACE_TYPE_LABELS.get(type_code, f"type {type_code}")
+        if isinstance(type_code, int)
+        else "unknown",
+        icao_class=_ICAO_CLASS_LABELS.get(icao_code, "") if isinstance(icao_code, int) else "",
+        lower_limit=_limit_label(mapping.get("lowerLimit")),
+    )
+
+
+def parse_airspaces(payload: object) -> tuple[Airspace, ...]:
+    """Parse an OpenAIP ``/airspaces`` list payload into typed airspace volumes.
+
+    Args:
+        payload: Decoded JSON from the OpenAIP airspaces endpoint.
+
+    Returns:
+        The parsed airspaces (possibly empty); entries without a name are skipped.
+
+    Raises:
+        AirspaceError: If the payload or its ``items`` array is missing or has an
+            unexpected shape.
+    """
+    if not isinstance(payload, dict):
+        not_dict_message = "airspace response"
+        raise AirspaceError(not_dict_message)
+    items = cast("dict[str, object]", payload).get("items")
+    if not isinstance(items, list):
+        items_message = "airspace items array"
+        raise AirspaceError(items_message)
+    airspaces: list[Airspace] = []
+    for item in cast("list[object]", items):
+        if isinstance(item, dict):
+            airspace = _airspace_from(cast("dict[str, object]", item))
+            if airspace is not None:
+                airspaces.append(airspace)
+    return tuple(airspaces)

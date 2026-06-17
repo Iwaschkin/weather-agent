@@ -13,9 +13,11 @@ from weather_agent.weather_codes import describe_weather_code
 
 if TYPE_CHECKING:
     from weather_agent.models import (
+        Airspace,
         CurrentReadings,
         CurrentWeather,
         DayAlmanac,
+        MetarReport,
         TimeSeries,
         UvIndex,
     )
@@ -317,6 +319,65 @@ def describe_comparison(
     if temp_a is not None and temp_b is not None:
         line += f" (delta {temp_b - temp_a:+.1f} °C)"
     return line + "."
+
+
+def _metar_wind(report: MetarReport) -> str:
+    if report.wind_speed_kt is None:
+        return ""
+    if report.wind_dir_deg is not None:
+        wind = f"wind {report.wind_dir_deg:.0f} deg at {report.wind_speed_kt:.0f} kt"
+    else:
+        wind = f"wind {report.wind_speed_kt:.0f} kt"
+    if report.wind_gust_kt is not None:
+        wind += f" gusting {report.wind_gust_kt:.0f} kt"
+    return wind
+
+
+def describe_metar(place_label: str, report: MetarReport) -> str:
+    """Render the nearest station's observed conditions as one line.
+
+    Args:
+        place_label: Human-readable location name.
+        report: The nearest METAR observation.
+
+    Returns:
+        A single-line observed-conditions summary (wind, visibility, ceiling).
+    """
+    ceiling = (
+        f"ceiling {report.ceiling_ft_agl:.0f} ft"
+        if report.ceiling_ft_agl is not None
+        else "no ceiling"
+    )
+    parts = [_metar_wind(report)]
+    if report.visibility_sm is not None:
+        parts.append(f"visibility {report.visibility_sm:.0f} SM")
+    parts.append(ceiling)
+    body = ", ".join(part for part in parts if part) or "no data"
+    return f"Nearest METAR for {place_label} - {report.station} (as of {report.observed}): {body}."
+
+
+def describe_airspace(place_label: str, airspaces: tuple[Airspace, ...], note: str = "") -> str:
+    """Render nearby airspace volumes as decision-support text (not authoritative).
+
+    Args:
+        place_label: Human-readable location name.
+        airspaces: Nearby drone-relevant airspaces.
+        note: A status line used instead of a list when the check was unavailable.
+
+    Returns:
+        A multi-line list of nearby airspace, a status note, or a "none found"
+        line - always reminding the reader to verify officially.
+    """
+    if note:
+        return f"Airspace near {place_label}: {note}"
+    if not airspaces:
+        return f"No notable airspace found near {place_label} (always verify officially)."
+    lines = [f"Airspace near {place_label} (verify on CAA Drone Assist / official sources):"]
+    for airspace in airspaces:
+        klass = f", ICAO {airspace.icao_class}" if airspace.icao_class else ""
+        base = f", base {airspace.lower_limit}" if airspace.lower_limit else ""
+        lines.append(f"  - {airspace.name} ({airspace.type_label}{klass}{base})")
+    return "\n".join(lines)
 
 
 def _uv_band(value: float) -> str:

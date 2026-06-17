@@ -305,6 +305,77 @@ class DroneProfile:
     low_light_capable: bool
 
 
+@dataclass(frozen=True, slots=True)
+class CloudLayer:
+    """A single reported cloud layer from a METAR.
+
+    Attributes:
+        cover: The coverage abbreviation (for example ``"FEW"``, ``"BKN"``,
+            ``"OVC"``).
+        base_ft_agl: Layer base height above ground level, in feet, or ``None``
+            when the report omits a base (for example for clear skies).
+    """
+
+    cover: str
+    base_ft_agl: float | None
+
+
+@dataclass(frozen=True, slots=True)
+class MetarReport:
+    """A decoded METAR observation from the nearest reporting station.
+
+    Provides observed conditions (a reality check against the model forecast) near
+    a site. ``ceiling_ft_agl`` is derived: the lowest broken/overcast layer base,
+    which is the operative cloud ceiling.
+
+    Attributes:
+        station: ICAO station identifier (for example ``"EGCC"``).
+        latitude: Station latitude in decimal degrees.
+        longitude: Station longitude in decimal degrees.
+        observed: Observation time as reported by the API.
+        wind_dir_deg: Wind direction in degrees, or ``None`` when variable/calm.
+        wind_speed_kt: Sustained wind speed in knots, or ``None`` when unknown.
+        wind_gust_kt: Gust speed in knots, or ``None`` when none reported.
+        visibility_sm: Horizontal visibility in statute miles, or ``None``.
+        clouds: Reported cloud layers in ascending order.
+        ceiling_ft_agl: Lowest broken/overcast base in feet AGL, or ``None`` when
+            no ceiling (clear or only few/scattered).
+        raw: The raw METAR text.
+    """
+
+    station: str
+    latitude: float
+    longitude: float
+    observed: str
+    wind_dir_deg: float | None
+    wind_speed_kt: float | None
+    wind_gust_kt: float | None
+    visibility_sm: float | None
+    clouds: tuple[CloudLayer, ...]
+    ceiling_ft_agl: float | None
+    raw: str
+
+
+@dataclass(frozen=True, slots=True)
+class Airspace:
+    """A nearby airspace volume from OpenAIP (decision support, not authoritative).
+
+    Attributes:
+        name: The airspace name (for example ``"MANCHESTER CTR"``).
+        type_label: Human-readable airspace type (for example ``"CTR"``,
+            ``"Restricted"``), mapped from OpenAIP's numeric type code.
+        icao_class: ICAO airspace class letter (for example ``"D"``), or an empty
+            string when unclassified or unknown.
+        lower_limit: Human-readable lower vertical limit (for example
+            ``"GND"`` or ``"1500 ft MSL"``), or an empty string when unknown.
+    """
+
+    name: str
+    type_label: str
+    icao_class: str
+    lower_limit: str
+
+
 class Verdict(Enum):
     """A flyability verdict for a single forecast hour.
 
@@ -388,6 +459,30 @@ class DroneAssessment:
     hours: tuple[HourAssessment, ...]
     best_window: FlightWindow | None
     daily: tuple[DayOutlook, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class SiteBriefing:
+    """Optional environmental context shown alongside a drone assessment.
+
+    Bundles the non-forecast briefing items (sun times, observed aviation weather,
+    nearby airspace) so the report renderer takes one context object rather than a
+    long parameter list. All fields are optional and default to "absent".
+
+    Attributes:
+        sun_times: Daily sun times; today's sunrise/sunset frame the daylight
+            window.
+        metar: The nearest station's observed conditions, or ``None`` when none was
+            found or the lookup failed.
+        airspace: Nearby drone-relevant airspace volumes to verify before flying.
+        airspace_note: A short status line when airspace could not be checked (for
+            example no API key configured), or an empty string.
+    """
+
+    sun_times: tuple[DayAlmanac, ...] = ()
+    metar: MetarReport | None = None
+    airspace: tuple[Airspace, ...] = ()
+    airspace_note: str = ""
 
 
 @dataclass(frozen=True, slots=True)

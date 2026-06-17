@@ -3,13 +3,17 @@
 import pytest
 
 from weather_agent.models import (
+    Airspace,
+    CloudLayer,
     CurrentReadings,
     CurrentWeather,
     DayAlmanac,
+    MetarReport,
     TimeSeries,
     UvIndex,
 )
 from weather_agent.reporting import (
+    describe_airspace,
     describe_comparison,
     describe_current_readings,
     describe_current_weather,
@@ -17,6 +21,7 @@ from weather_agent.reporting import (
     describe_ensemble_spread,
     describe_forecast_day,
     describe_latest_values,
+    describe_metar,
     describe_period,
     describe_solar,
     describe_sun_times,
@@ -279,6 +284,72 @@ def test_describe_solar_reports_radiation_and_hours() -> None:
     assert "radiation 28.0 MJ/m²" in summary
     assert "sunshine 10.0 h" in summary
     assert "daylight 16.0 h" in summary
+
+
+def test_describe_metar_renders_observed_conditions() -> None:
+    """METAR rendering names the station, wind, visibility, and ceiling."""
+    report = MetarReport(
+        station="EGCC",
+        latitude=53.35,
+        longitude=-2.28,
+        observed="2026-06-16 12:00:00",
+        wind_dir_deg=240.0,
+        wind_speed_kt=12.0,
+        wind_gust_kt=20.0,
+        visibility_sm=10.0,
+        clouds=(CloudLayer("OVC", 2500.0),),
+        ceiling_ft_agl=2500.0,
+        raw="EGCC 161200Z 24012G20KT",
+    )
+
+    summary = describe_metar("Manchester", report)
+
+    assert "Nearest METAR for Manchester - EGCC" in summary
+    assert "wind 240 deg at 12 kt gusting 20 kt" in summary
+    assert "ceiling 2500 ft" in summary
+
+
+def test_describe_metar_handles_no_ceiling() -> None:
+    """A report with no broken/overcast layer shows 'no ceiling'."""
+    report = MetarReport(
+        station="EGCC",
+        latitude=53.35,
+        longitude=-2.28,
+        observed="t",
+        wind_dir_deg=None,
+        wind_speed_kt=None,
+        wind_gust_kt=None,
+        visibility_sm=None,
+        clouds=(),
+        ceiling_ft_agl=None,
+        raw="",
+    )
+
+    assert "no ceiling" in describe_metar("Manchester", report)
+
+
+def test_describe_airspace_lists_zones() -> None:
+    """Airspace rendering lists each zone with type and class, and a verify note."""
+    airspaces = (
+        Airspace(name="MANCHESTER CTR", type_label="CTR", icao_class="D", lower_limit="GND"),
+    )
+
+    summary = describe_airspace("Manchester", airspaces)
+
+    assert "MANCHESTER CTR (CTR, ICAO D, base GND)" in summary
+    assert "verify" in summary.lower()
+
+
+def test_describe_airspace_uses_note_when_unavailable() -> None:
+    """A status note replaces the list when the check could not run."""
+    summary = describe_airspace("Manchester", (), note="unavailable (no OPENAIP_API_KEY)")
+
+    assert "unavailable (no OPENAIP_API_KEY)" in summary
+
+
+def test_describe_airspace_none_found() -> None:
+    """No nearby airspace yields a reassuring-but-verify line."""
+    assert "No notable airspace" in describe_airspace("Remote", ())
 
 
 def test_describe_comparison_omits_delta_when_data_missing() -> None:
