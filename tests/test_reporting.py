@@ -108,8 +108,8 @@ def test_describe_latest_values_reports_first_row() -> None:
     summary = describe_latest_values("Berlin", series, "Air quality", ("pm2_5", "pm10"))
 
     assert "Air quality for Berlin (as of 2026-06-15T00:00)" in summary
-    assert "pm2_5 12.0" in summary
-    assert "pm10 20.0" in summary
+    assert "PM2.5 12.0 µg/m³ (fair)" in summary
+    assert "PM10 20.0 µg/m³ (fair)" in summary
 
 
 def test_describe_latest_values_handles_empty_series() -> None:
@@ -132,8 +132,8 @@ def test_describe_current_readings_reports_present_hour() -> None:
     )
 
     assert "Air quality for Berlin (as of 2026-06-15T13:00)" in summary
-    assert "pm2_5 12.0" in summary
-    assert "european_aqi n/a" in summary
+    assert "PM2.5 12.0 µg/m³ (fair)" in summary
+    assert "European AQI n/a" in summary
 
 
 def test_describe_ensemble_spread_reports_range_and_mean() -> None:

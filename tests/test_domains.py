@@ -112,8 +112,9 @@ def test_air_quality_summary_reports_readings() -> None:
     assert "Air quality for Berlin, Germany" in summary
     # Reports the present hour from the current block, not the start of the day.
     assert "(as of 2026-06-15T13:00)" in summary
-    assert "pm2_5 12.0" in summary
-    assert "european_aqi 33.0" in summary
+    # Banded, not raw: PM2.5 12 -> fair, European AQI 33 -> fair.
+    assert "PM2.5 12.0 µg/m³ (fair)" in summary
+    assert "European AQI 33.0 (fair)" in summary
 
 
 def test_marine_summary_reports_waves() -> None:
@@ -121,7 +122,7 @@ def test_marine_summary_reports_waves() -> None:
     summary = render(marine_summary("Honolulu", client=_client_for("marine", _MARINE_BODY)))
 
     assert "Marine conditions for Berlin, Germany" in summary
-    assert "wave_height 1.4" in summary
+    assert "Wave height 1.4 m (moderate)" in summary
 
 
 def test_marine_summary_reports_inland_as_non_coastal() -> None:
@@ -159,7 +160,8 @@ def test_river_discharge_summary_reports_discharge() -> None:
     summary = render(river_discharge_summary("Cologne", client=_client_for("flood", _FLOOD_BODY)))
 
     assert "River discharge for Berlin, Germany" in summary
-    assert "river_discharge 120.0" in summary
+    # No defensible absolute flood band yet, so discharge stays raw (humanized name).
+    assert "River discharge 120.0" in summary
 
 
 def test_ensemble_summary_reports_spread() -> None:
@@ -194,8 +196,10 @@ def test_pollen_summary_reports_levels() -> None:
     summary = render(pollen_summary("Paris", client=_client_for("air-quality", _POLLEN_BODY)))
 
     assert "Pollen for Berlin, Germany" in summary
-    assert "grass_pollen 45.0" in summary
-    assert "alder_pollen n/a" in summary
+    # Pollen bands are deferred (per-taxon thresholds need a pinned source), so the
+    # values render with a humanized name but no band for now.
+    assert "Grass pollen 45.0" in summary
+    assert "Alder pollen n/a" in summary
 
 
 def test_solar_summary_reports_radiation_and_hours() -> None:

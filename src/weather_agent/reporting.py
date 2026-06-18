@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+from weather_agent.bands import UV_SCALE, classify, render_reading
 from weather_agent.weather_codes import describe_weather_code
 
 if TYPE_CHECKING:
@@ -28,16 +29,6 @@ _SOLAR_RADIATION_SUM = "shortwave_radiation_sum"
 _SUNSHINE_DURATION = "sunshine_duration"
 _DAYLIGHT_DURATION = "daylight_duration"
 SOLAR_DAILY_VARIABLES = f"{_SOLAR_RADIATION_SUM},{_SUNSHINE_DURATION},{_DAYLIGHT_DURATION}"
-
-# UV index risk bands (WHO): (exclusive upper bound, label). The final band has
-# no upper bound and catches everything above the previous threshold.
-_UV_BANDS: tuple[tuple[float, str], ...] = (
-    (3.0, "low"),
-    (6.0, "moderate"),
-    (8.0, "high"),
-    (11.0, "very high"),
-)
-_UV_EXTREME = "extreme"
 
 _TEMP_MAX = "temperature_2m_max"
 _TEMP_MIN = "temperature_2m_min"
@@ -207,7 +198,7 @@ def describe_latest_values(
     if not series.timestamps:
         return f"No {label.lower()} data available for {place_label}."
     readings = ", ".join(
-        f"{variable} {_format_value(_cell(series, variable, 0))}" for variable in variables
+        render_reading(variable, _cell(series, variable, 0)) for variable in variables
     )
     return f"{label} for {place_label} (as of {series.timestamps[0]}): {readings}."
 
@@ -260,7 +251,7 @@ def describe_current_readings(
         reading's own time.
     """
     rendered = ", ".join(
-        f"{variable} {_format_value(readings.values.get(variable))}" for variable in variables
+        render_reading(variable, readings.values.get(variable)) for variable in variables
     )
     return f"{label} for {place_label} (as of {readings.time}): {rendered}."
 
@@ -380,13 +371,6 @@ def describe_airspace(place_label: str, airspaces: tuple[Airspace, ...], note: s
     return "\n".join(lines)
 
 
-def _uv_band(value: float) -> str:
-    for upper, label in _UV_BANDS:
-        if value < upper:
-            return label
-    return _UV_EXTREME
-
-
 def describe_uv(place_label: str, uv: UvIndex) -> str:
     """Render the UV index now and today's peak with WHO risk bands.
 
@@ -401,9 +385,9 @@ def describe_uv(place_label: str, uv: UvIndex) -> str:
         return f"No UV data available for {place_label}."
     parts: list[str] = []
     if uv.current is not None:
-        parts.append(f"now {uv.current:.1f} ({_uv_band(uv.current)})")
+        parts.append(f"now {uv.current:.1f} ({classify(UV_SCALE, uv.current)})")
     if uv.today_max is not None:
-        parts.append(f"today's max {uv.today_max:.1f} ({_uv_band(uv.today_max)})")
+        parts.append(f"today's max {uv.today_max:.1f} ({classify(UV_SCALE, uv.today_max)})")
     return f"UV index for {place_label} (as of {uv.time}): " + ", ".join(parts) + "."
 
 
