@@ -1,5 +1,12 @@
+.states
+.web
+*.py[cod]
 # Reflex build/runtime artifacts
 .web/
+.states/
+reflex.lock/
 *.db
 assets/external/
 __pycache__/
+# uv manages dependencies; reflex's generated requirements.txt is not the source of truth
+requirements.txt
