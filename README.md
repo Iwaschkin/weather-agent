@@ -194,3 +194,7 @@ uv run ruff format .
 uv run pyright
 uv run pytest
 ```
+
+## License
+
+[MIT](LICENSE) © 2026 David Iwaschkin.

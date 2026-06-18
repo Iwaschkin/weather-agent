@@ -3,6 +3,8 @@ name = "weather-agent"
 version = "0.1.0"
 description = "A Strands agent that interacts with the open-meteo.com weather API."
 readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
 authors = [
     { name = "Iwaschkin", email = "david.iwaschkin@pm.me" }
 ]
