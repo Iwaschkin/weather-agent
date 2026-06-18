@@ -29,11 +29,17 @@ from weather_agent.drone_report import (
     describe_supported_drones,
     reconcile_metar,
 )
-from weather_agent.evaluation import audit_drone_report
+from weather_agent.evaluation import SAFETY_BANNER, audit_drone_report
 from weather_agent.flyability import assess_forecast
 from weather_agent.geocoding import parse_location, select_best_match
 from weather_agent.knowledge import load_sections, retrieve
-from weather_agent.models import ClimateRequest, FleetMember, HistoricalRequest, SiteBriefing
+from weather_agent.models import (
+    ClimateRequest,
+    FleetAssessment,
+    FleetMember,
+    HistoricalRequest,
+    SiteBriefing,
+)
 from weather_agent.openaip import OpenAipClient
 from weather_agent.parsing import ExternalDataError, OpenMeteoError, SpaceWeatherError
 from weather_agent.reporting import (
@@ -119,6 +125,16 @@ def _resolve_iso(text: str, reference: date) -> str | None:
     return resolved.isoformat() if resolved is not None else None
 
 
+def _resolve_place(active: OpenMeteoClient, location: str) -> GeocodeResult | None:
+    """Geocode a free-text location to its best matching place, or None.
+
+    Shared by the text summaries and the structured fleet assessment so both resolve
+    locations identically.
+    """
+    query = parse_location(location)
+    return select_best_match(active.geocode(query.name), query.qualifier)
+
+
 def _summarize(
     location: str,
     client: OpenMeteoClient | None,
@@ -141,9 +157,7 @@ def _summarize(
     owns_client = client is None
     active = client if client is not None else OpenMeteoClient()
     try:
-        query = parse_location(location)
-        matches = active.geocode(query.name)
-        place = select_best_match(matches, query.qualifier)
+        place = _resolve_place(active, location)
         if place is None:
             return NotFound(location)
         return Answer(describe(active, place))
@@ -843,11 +857,8 @@ def rank_locations(
 
 
 _DRONE_FORECAST_DAYS = 5
+_MAX_DRONE_FORECAST_DAYS = 7
 _UK_TIMEZONE = ZoneInfo("Europe/London")
-_SAFETY_BANNER = (
-    "WARNING: an automated check found this assessment may under-state the risk. "
-    "Treat any hour as NO-FLY if in doubt and verify conditions yourself."
-)
 
 
 @dataclass(frozen=True, slots=True)
@@ -1097,7 +1108,7 @@ def _drone_report(
     tips = retrieve(factors or "pre-flight wind battery", load_sections())
     report = describe_drone_assessment(assessment, caa_guidance(profile), tips, briefing)
     if audit_drone_report(assessment, report):
-        return f"{_SAFETY_BANNER}\n\n{report}"
+        return f"{SAFETY_BANNER}\n\n{report}"
     return report
 
 
@@ -1167,19 +1178,20 @@ def _fleet_report(
     tips = retrieve(factors or "pre-flight wind battery", load_sections())
     report = describe_fleet_assessment(members, place_label, tips, briefing)
     if any(audit_drone_report(member.assessment, report) for member in members):
-        return f"{_SAFETY_BANNER}\n\n{report}"
+        return f"{SAFETY_BANNER}\n\n{report}"
     return report
 
 
 def _fleet_members(
     active: OpenMeteoClient,
     place: GeocodeResult,
-    aviation: AviationClient,
-    openaip: OpenAipClient,
+    site: tuple[AviationClient, OpenAipClient],
     reference: datetime,
+    days: int = _DRONE_FORECAST_DAYS,
 ) -> tuple[tuple[FleetMember, ...], str, SiteBriefing]:
     """Assess every supported drone against one shared forecast, Kp, and briefing."""
-    forecast = active.drone_forecast(place.latitude, place.longitude, _DRONE_FORECAST_DAYS)
+    aviation, openaip = site
+    forecast = active.drone_forecast(place.latitude, place.longitude, days)
     kp_by_time = _drone_kp_by_hour(active, forecast.hours)
     briefing = _with_metar_comparison(_site_briefing(active, aviation, openaip, place), forecast)
     label = _place_label(place)
@@ -1222,12 +1234,59 @@ def fleet_flight_summary(
     Returns:
         An outcome wrapping a compact fleet assessment over all supported drones.
     """
+    try:
+        assessment = assess_fleet(location, _DRONE_FORECAST_DAYS, client, now, site_clients)
+    except (httpx.HTTPError, ExternalDataError) as error:
+        return Failed(location, str(error))
+    if assessment is None:
+        return NotFound(location)
+    return Answer(_fleet_report(assessment.members, assessment.place_label, assessment.briefing))
+
+
+def assess_fleet(
+    location: str,
+    days: int = _DRONE_FORECAST_DAYS,
+    client: OpenMeteoClient | None = None,
+    now: datetime | None = None,
+    site_clients: SiteClients | None = None,
+) -> FleetAssessment | None:
+    """Assess every supported drone at a location and return structured results.
+
+    The typed counterpart to :func:`fleet_flight_summary` (which renders text):
+    fetches the drone-tuned forecast, planetary Kp, and site briefing once, runs the
+    flyability rules for each drone, and returns the per-drone assessments and shared
+    briefing as objects for a caller that draws its own output (for example a UI).
+    Both paths share one engine, so they never diverge.
+
+    Args:
+        location: A city or place name.
+        days: Forecast horizon in days (1 to 7).
+        client: Optional client to use.
+        now: Current naive UK-local time; hours before it are excluded.
+        site_clients: Optional injected aviation/airspace clients.
+
+    Returns:
+        The structured fleet assessment, or ``None`` when the location does not
+        resolve.
+
+    Raises:
+        ValueError: If ``days`` is outside 1 to 7.
+        httpx.HTTPError: If a lookup fails or returns an error status.
+        ExternalDataError: If an external payload is malformed.
+    """
+    if not 1 <= days <= _MAX_DRONE_FORECAST_DAYS:
+        message = f"days must be between 1 and {_MAX_DRONE_FORECAST_DAYS} (got {days})."
+        raise ValueError(message)
     reference = now if now is not None else datetime.now(_UK_TIMEZONE).replace(tzinfo=None)
-
-    with _open_site_clients(site_clients) as (aviation, openaip):
-
-        def describe(active: OpenMeteoClient, place: GeocodeResult) -> str:
-            members, label, briefing = _fleet_members(active, place, aviation, openaip, reference)
-            return _fleet_report(members, label, briefing)
-
-        return _summarize(location, client, describe)
+    owns_client = client is None
+    active = client if client is not None else OpenMeteoClient()
+    try:
+        place = _resolve_place(active, location)
+        if place is None:
+            return None
+        with _open_site_clients(site_clients) as site:
+            members, label, briefing = _fleet_members(active, place, site, reference, days)
+        return FleetAssessment(place_label=label, members=members, briefing=briefing)
+    finally:
+        if owns_client:
+            active.close()

@@ -3,6 +3,7 @@
 from datetime import datetime
 
 import httpx
+import pytest
 
 from weather_agent.aviation import AviationClient
 from weather_agent.caa import caa_guidance
@@ -29,7 +30,12 @@ from weather_agent.models import (
 )
 from weather_agent.openaip import OpenAipClient
 from weather_agent.results import render
-from weather_agent.weather import SiteClients, drone_flight_summary, fleet_flight_summary
+from weather_agent.weather import (
+    SiteClients,
+    assess_fleet,
+    drone_flight_summary,
+    fleet_flight_summary,
+)
 
 # Fixed reference time so the fixture's 10:00/11:00 hours are never filtered as past.
 _NOW = datetime(2026, 6, 16, 9, 0)  # noqa: DTZ001
@@ -466,3 +472,43 @@ def test_drone_flight_summary_reconciles_metar_with_forecast() -> None:
     assert "Observed vs forecast (now):" in summary
     assert "gusts" in summary
     assert "visibility" in summary
+
+
+def test_assess_fleet_returns_structured_members() -> None:
+    """The structured path returns typed per-drone assessments, not text."""
+    result = assess_fleet(
+        "Congleton UK",
+        days=7,
+        client=_drone_client(),
+        now=_NOW,
+        site_clients=_site_clients(_METAR_BODY, _AIRSPACE_BODY),
+    )
+
+    assert result is not None
+    assert "Congleton, England" in result.place_label
+    assert tuple(member.profile.name for member in result.members) == (
+        "DJI Neo",
+        "DJI Avata 2",
+        "DJI Mini 5 Pro",
+    )
+    assert all(member.assessment.hours for member in result.members)
+
+
+def test_assess_fleet_unknown_location_is_none() -> None:
+    """An unresolvable location yields None rather than raising."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.host.startswith("geocoding"):
+            return httpx.Response(200, json={"results": []})
+        return httpx.Response(200, json=_DRONE_BODY)
+
+    client = OpenMeteoClient(client=httpx.Client(transport=httpx.MockTransport(handler)))
+
+    assert assess_fleet("Nowheresville", client=client, site_clients=_site_clients([])) is None
+
+
+@pytest.mark.parametrize("days", [0, 8])
+def test_assess_fleet_rejects_out_of_range_days(days: int) -> None:
+    """Day counts outside 1..7 are rejected before any network call."""
+    with pytest.raises(ValueError, match="days must be between"):
+        _ = assess_fleet("Congleton UK", days=days)

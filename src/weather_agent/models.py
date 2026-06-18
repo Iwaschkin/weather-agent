@@ -577,6 +577,25 @@ class FleetMember:
 
 
 @dataclass(frozen=True, slots=True)
+class FleetAssessment:
+    """The structured result of assessing every drone at one location.
+
+    The typed counterpart to the rendered fleet report: it carries the per-drone
+    assessments and the shared site briefing so a caller (for example a UI) can draw
+    its own output instead of parsing text.
+
+    Attributes:
+        place_label: Human-readable location the assessment is for.
+        members: One :class:`FleetMember` per supported drone, sharing one forecast.
+        briefing: Shared site context (sun times, METAR, airspace).
+    """
+
+    place_label: str
+    members: tuple[FleetMember, ...]
+    briefing: SiteBriefing
+
+
+@dataclass(frozen=True, slots=True)
 class KpIndex:
     """The latest planetary K-index (geomagnetic activity).
 

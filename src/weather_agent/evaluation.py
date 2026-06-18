@@ -24,6 +24,13 @@ from weather_agent.models import Verdict
 if TYPE_CHECKING:
     from weather_agent.models import DroneAssessment, HourAssessment
 
+# Prepended to any report the audit finds under-states the risk. Shared by the
+# deterministic renderers and the LLM report path so the warning never drifts.
+SAFETY_BANNER = (
+    "WARNING: an automated check found this assessment may under-state the risk. "
+    "Treat any hour as NO-FLY if in doubt and verify conditions yourself."
+)
+
 # Keywords that show a gate's metric is actually referenced in the prose. A
 # limiting metric whose keywords are all absent is an ungrounded omission.
 _METRIC_KEYWORDS: dict[str, tuple[str, ...]] = {

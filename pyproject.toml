@@ -33,6 +33,10 @@ dev = [
 [tool.ruff]
 # Explicit line length to avoid relying on defaults and to align CI/editor behaviour
 line-length = 100
+# The Reflex web app (web/) is a thin UI layer outside the strict src/ baseline:
+# its component/state DSL fights strict typing, and it is already outside Pyright's
+# include. Exclude it from the core lint rather than weakening any rule for src/.
+extend-exclude = ["web"]
 
 [tool.ruff.lint]
 select = [
