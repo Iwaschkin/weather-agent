@@ -556,6 +556,24 @@ class CaaGuidance:
 
 
 @dataclass(frozen=True, slots=True)
+class FleetMember:
+    """One drone paired with its flyability assessment and CAA guidance.
+
+    Bundles the three per-drone artifacts the fleet renderer needs so it can show
+    every drone at one site side by side without parallel-list bookkeeping.
+
+    Attributes:
+        profile: The drone's specification (name, wind limit, weight).
+        assessment: The per-hour flyability assessment for this drone.
+        guidance: UK CAA guidance for this drone's class.
+    """
+
+    profile: DroneProfile
+    assessment: DroneAssessment
+    guidance: CaaGuidance
+
+
+@dataclass(frozen=True, slots=True)
 class KpIndex:
     """The latest planetary K-index (geomagnetic activity).
 

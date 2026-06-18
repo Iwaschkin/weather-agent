@@ -18,6 +18,7 @@ from weather_agent.weather import (
     drone_flight_summary,
     elevation_summary,
     ensemble_summary,
+    fleet_flight_summary,
     forecast_summary,
     historical_summary,
     marine_summary,
@@ -331,7 +332,11 @@ def compare_weather(
 
 @tool
 def assess_drone_conditions(location: str, drone: str) -> str:
-    """Assess whether weather is suitable for flying a specific drone today.
+    """Assess whether weather is suitable for flying one specific drone today.
+
+    Use this for a single named drone. To cover the whole fleet (for example
+    "all my drones" or "every drone"), use ``assess_fleet_conditions`` instead -
+    do not call this tool once per drone.
 
     Covers the DJI Neo, Avata 2, and Mini 5 Pro. Combines wind and gusts up to
     500 m, precipitation, temperature, visibility, daylight, thunderstorm
@@ -351,6 +356,32 @@ def assess_drone_conditions(location: str, drone: str) -> str:
         tips; or a list of supported drones when the model is not recognised.
     """
     return render(drone_flight_summary(location, drone))
+
+
+@tool
+def assess_fleet_conditions(location: str) -> str:
+    """Assess flying conditions for every supported drone at once.
+
+    Use this when the user asks about all of their drones (for example "all my
+    drones", "the fleet", or "every drone") rather than naming one - it covers the
+    DJI Neo, Avata 2, and Mini 5 Pro in a single combined report, so you do not
+    need to call ``assess_drone_conditions`` once per drone.
+
+    Returns a compact comparison: shared site context (daylight, observed METAR,
+    nearby airspace) and UK CAA rules once, then each drone's wind limit, best
+    flying window, and per-day outlook side by side. Always relay the disclaimer.
+
+    UK-scoped like ``assess_drone_conditions``: hourly timestamps are UK local
+    time and the guidance follows UK CAA open-category rules.
+
+    Args:
+        location: A city or place name, for example "Congleton UK".
+
+    Returns:
+        A compact side-by-side flyability comparison across all supported drones,
+        with shared site context, UK CAA notes, and the safety disclaimer.
+    """
+    return render(fleet_flight_summary(location))
 
 
 @tool

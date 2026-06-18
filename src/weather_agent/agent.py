@@ -5,6 +5,7 @@ from strands.models.ollama import OllamaModel
 
 from weather_agent.tools import (
     assess_drone_conditions,
+    assess_fleet_conditions,
     compare_weather,
     get_air_quality,
     get_airspace,
@@ -43,9 +44,12 @@ _SYSTEM_PROMPT = (
     "not authoritative), and get_elevation (terrain height). When the user gives a "
     "latitude and longitude instead of a place name, "
     "use get_weather_at_coordinates. For drone flying (DJI Neo, "
-    "Avata 2, Mini 5 Pro) use assess_drone_conditions, and list_supported_drones to "
-    "see which models are covered; always pass on its UK CAA notes and safety "
-    "disclaimer, and never present it as legal or airworthiness authority. Date-based "
+    "Avata 2, Mini 5 Pro) use assess_drone_conditions for one named drone, or "
+    "assess_fleet_conditions when the user asks about all their drones or the whole "
+    "fleet (do not call the single-drone tool once per drone); use "
+    "list_supported_drones to see which models are covered. Always pass on the UK CAA "
+    "notes and safety disclaimer, and never present it as legal or airworthiness "
+    "authority. Date-based "
     "tools take ISO start and end dates (YYYY-MM-DD)."
 )
 _DEFAULT_OLLAMA_HOST = "http://localhost:11434"
@@ -93,6 +97,7 @@ def build_agent(
             get_elevation,
             get_weather_at_coordinates,
             assess_drone_conditions,
+            assess_fleet_conditions,
             list_supported_drones,
         ],
     )

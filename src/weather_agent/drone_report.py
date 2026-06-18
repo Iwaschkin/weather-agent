@@ -19,6 +19,7 @@ if TYPE_CHECKING:
         DayAlmanac,
         DayOutlook,
         DroneAssessment,
+        FleetMember,
         FlightWindow,
         HourAssessment,
     )
@@ -63,20 +64,24 @@ def _render_hour(hour: HourAssessment) -> str:
     return f"  {hour.time}  {label}"
 
 
-def _render_daily_outlook(daily: tuple[DayOutlook, ...]) -> list[str]:
-    if not daily:
-        return []
-    lines = ["Daily outlook:"]
+def _daily_rows(daily: tuple[DayOutlook, ...]) -> list[str]:
+    rows: list[str] = []
     for day in daily:
         if day.best_window is not None:
             window = day.best_window
-            lines.append(
-                f"  {day.date}: {day.good_hours} good h, "
+            rows.append(
+                f"{day.date}: {day.good_hours} good h, "
                 f"best {format_clock(window.start_time)}-{format_clock(window.end_time)}"
             )
         else:
-            lines.append(f"  {day.date}: no good-to-fly hours")
-    return lines
+            rows.append(f"{day.date}: no good-to-fly hours")
+    return rows
+
+
+def _render_daily_outlook(daily: tuple[DayOutlook, ...]) -> list[str]:
+    if not daily:
+        return []
+    return ["Daily outlook:", *(f"  {row}" for row in _daily_rows(daily))]
 
 
 def _render_hours(hours: tuple[HourAssessment, ...], max_hours: int) -> list[str]:
@@ -141,6 +146,84 @@ def describe_drone_assessment(
     if tips:
         lines.extend(("", *_render_tips(tips)))
     lines.extend(("", guidance.disclaimer))
+    return "\n".join(lines)
+
+
+def _window_summary(window: FlightWindow | None) -> str:
+    if window is None:
+        return "no good-to-fly hours"
+    return f"{window.start_time} to {window.end_time} ({window.hours} h)"
+
+
+def _render_fleet_comparison(members: tuple[FleetMember, ...]) -> list[str]:
+    lines = ["Fleet comparison (wind limit - best window):"]
+    lines.extend(
+        f"  {member.profile.name}: {member.profile.caution_gust_ms:.1f} m/s - "
+        f"{_window_summary(member.assessment.best_window)}"
+        for member in members
+    )
+    return lines
+
+
+def _render_fleet_member(member: FleetMember) -> list[str]:
+    guidance = member.guidance
+    lines = [f"{member.profile.name} ({guidance.uk_class_label} {guidance.subcategory}):"]
+    lines.extend(f"  {row}" for row in _daily_rows(member.assessment.daily))
+    if guidance.key_rules:
+        # key_rules[0] is the class-specific people rule; [1:] are shared (rendered once).
+        lines.append(f"  People: {guidance.key_rules[0]}")
+    if guidance.class_caveat:
+        lines.append(f"  Caveat: {guidance.class_caveat}")
+    return lines
+
+
+def _render_shared_caa(reference: CaaGuidance) -> list[str]:
+    lines = ["UK CAA notes (all drones, open category):"]
+    lines.extend(f"  - {rule}" for rule in reference.key_rules[1:])
+    lines.append(f"  Height: {reference.height_limit_note}")
+    return lines
+
+
+def describe_fleet_assessment(
+    members: tuple[FleetMember, ...],
+    place_label: str,
+    tips: tuple[KnowledgeSection, ...] = (),
+    briefing: SiteBriefing | None = None,
+) -> str:
+    """Render a compact side-by-side flyability report for a fleet of drones.
+
+    Shows the shared site context (daylight, METAR, airspace) and the universal
+    UK CAA rules once, then a per-drone comparison and daily outlook, so a single
+    request covers the whole fleet without repeating common context per drone.
+
+    Args:
+        members: Each drone paired with its assessment and CAA guidance; all share
+            one site and forecast. An empty tuple yields a short "nothing to
+            assess" line.
+        place_label: Human-readable location the assessment is for.
+        tips: Retrieved qualitative knowledge sections shared across drones.
+        briefing: Optional environmental context; omitted sections are not shown.
+
+    Returns:
+        A multi-section fleet summary ending with the CAA disclaimer.
+    """
+    if not members:
+        return f"No supported drones to assess at {place_label}."
+    if briefing is None:
+        briefing = SiteBriefing()
+    reference = members[0].guidance
+    lines = [f"Fleet flight assessment - {len(members)} drones at {place_label}"]
+    briefing_lines = _render_briefing(place_label, briefing)
+    if briefing_lines:
+        lines.extend(("", *briefing_lines))
+    lines.extend(("", *_render_fleet_comparison(members)))
+    lines.extend(("", "Per-drone outlook:"))
+    for member in members:
+        lines.extend(("", *(f"  {row}" for row in _render_fleet_member(member))))
+    lines.extend(("", *_render_shared_caa(reference)))
+    if tips:
+        lines.extend(("", *_render_tips(tips)))
+    lines.extend(("", reference.disclaimer))
     return "\n".join(lines)
 
 

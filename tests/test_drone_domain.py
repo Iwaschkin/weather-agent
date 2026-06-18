@@ -8,12 +8,17 @@ from weather_agent.aviation import AviationClient
 from weather_agent.caa import caa_guidance
 from weather_agent.client import OpenMeteoClient
 from weather_agent.drone import DRONE_PROFILES, MINI_5_PRO
-from weather_agent.drone_report import describe_drone_assessment, describe_supported_drones
+from weather_agent.drone_report import (
+    describe_drone_assessment,
+    describe_fleet_assessment,
+    describe_supported_drones,
+)
 from weather_agent.knowledge import KnowledgeSection
 from weather_agent.models import (
     DayAlmanac,
     DayOutlook,
     DroneAssessment,
+    FleetMember,
     FlightWindow,
     HourAssessment,
     SiteBriefing,
@@ -21,7 +26,7 @@ from weather_agent.models import (
 )
 from weather_agent.openaip import OpenAipClient
 from weather_agent.results import render
-from weather_agent.weather import SiteClients, drone_flight_summary
+from weather_agent.weather import SiteClients, drone_flight_summary, fleet_flight_summary
 
 # Fixed reference time so the fixture's 10:00/11:00 hours are never filtered as past.
 _NOW = datetime(2026, 6, 16, 9, 0)  # noqa: DTZ001
@@ -297,3 +302,65 @@ def test_drone_flight_summary_survives_kp_outage() -> None:
     )
 
     assert "DJI Neo at Congleton, England" in summary
+
+
+def _fleet_members() -> tuple[FleetMember, ...]:
+    return tuple(
+        FleetMember(
+            profile=profile,
+            assessment=DroneAssessment(
+                drone_name=profile.name,
+                place_label="Congleton, England",
+                hours=(HourAssessment("2026-06-16T10:00", Verdict.GOOD, (), 4.0),),
+                best_window=FlightWindow("2026-06-16T10:00", "2026-06-16T10:00", 1),
+                daily=(
+                    DayOutlook(
+                        "2026-06-16",
+                        1,
+                        FlightWindow("2026-06-16T10:00", "2026-06-16T10:00", 1),
+                    ),
+                ),
+            ),
+            guidance=caa_guidance(profile),
+        )
+        for profile in DRONE_PROFILES
+    )
+
+
+def test_describe_fleet_assessment_covers_every_drone_with_shared_context() -> None:
+    """The fleet report names every drone but renders shared context only once."""
+    text = describe_fleet_assessment(_fleet_members(), "Congleton, England")
+
+    assert "Fleet flight assessment - 3 drones at Congleton, England" in text
+    assert "Fleet comparison" in text
+    for profile in DRONE_PROFILES:
+        assert profile.name in text
+    # The CAA rules and disclaimer are shared, not repeated per drone.
+    assert text.count("UK CAA notes (all drones") == 1
+    assert text.count("not legal") == 1
+
+
+def test_describe_fleet_assessment_handles_no_members() -> None:
+    """An empty fleet yields a short message rather than an empty report."""
+    assert "No supported drones" in describe_fleet_assessment((), "Congleton")
+
+
+def test_fleet_flight_summary_assesses_all_supported_drones() -> None:
+    """One fleet call covers every drone with the site context fetched once."""
+    summary = render(
+        fleet_flight_summary(
+            "Congleton UK",
+            client=_drone_client(),
+            now=_NOW,
+            site_clients=_site_clients(_METAR_BODY, _AIRSPACE_BODY),
+        )
+    )
+
+    assert "Fleet flight assessment - 3 drones at Congleton, England" in summary
+    assert "DJI Neo" in summary
+    assert "DJI Avata 2" in summary
+    assert "DJI Mini 5 Pro" in summary
+    # METAR and disclaimer are shared site context, rendered once for the fleet.
+    assert summary.count("Nearest METAR") == 1
+    assert "MANCHESTER CTR" in summary
+    assert summary.count("not legal") == 1

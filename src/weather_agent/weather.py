@@ -10,6 +10,7 @@ callers can compose outcomes safely. The tool layer renders the outcome to text.
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
 from typing import TYPE_CHECKING
@@ -21,12 +22,16 @@ from weather_agent.aviation import AviationClient
 from weather_agent.caa import caa_guidance
 from weather_agent.client import OpenMeteoClient
 from weather_agent.drone import DRONE_PROFILES, find_profile
-from weather_agent.drone_report import describe_drone_assessment, describe_supported_drones
+from weather_agent.drone_report import (
+    describe_drone_assessment,
+    describe_fleet_assessment,
+    describe_supported_drones,
+)
 from weather_agent.evaluation import audit_drone_report
 from weather_agent.flyability import assess_forecast
 from weather_agent.geocoding import parse_location, select_best_match
 from weather_agent.knowledge import load_sections, retrieve
-from weather_agent.models import ClimateRequest, HistoricalRequest, SiteBriefing
+from weather_agent.models import ClimateRequest, FleetMember, HistoricalRequest, SiteBriefing
 from weather_agent.openaip import OpenAipClient
 from weather_agent.parsing import ExternalDataError, OpenMeteoError, SpaceWeatherError
 from weather_agent.reporting import (
@@ -51,7 +56,7 @@ from weather_agent.results import Answer, Failed, Invalid, LookupOutcome, NotFou
 from weather_agent.routing import FORECAST_HORIZON_DAYS, DataSource, select_data_source
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Generator
 
     from weather_agent.models import (
         Airspace,
@@ -709,6 +714,36 @@ class SiteClients:
     openaip: OpenAipClient | None = None
 
 
+@contextmanager
+def _open_site_clients(
+    site_clients: SiteClients | None,
+) -> Generator[tuple[AviationClient, OpenAipClient]]:
+    """Yield the aviation and airspace clients, closing any this call created.
+
+    Tests inject mock-transport clients via ``site_clients`` and own their
+    lifecycle; any client not injected is created here and closed on exit. Both
+    the single-drone and fleet assessments share this so the open/close dance
+    lives in one place.
+
+    Args:
+        site_clients: Optional pre-built clients; ``None`` (or a ``None`` field)
+            means create that client internally and close it afterwards.
+
+    Yields:
+        The aviation and OpenAIP clients to use for the assessment.
+    """
+    site = site_clients if site_clients is not None else SiteClients()
+    aviation = site.aviation if site.aviation is not None else AviationClient()
+    openaip = site.openaip if site.openaip is not None else OpenAipClient()
+    try:
+        yield aviation, openaip
+    finally:
+        if site.aviation is None:
+            aviation.close()
+        if site.openaip is None:
+            openaip.close()
+
+
 def _best_effort_kp(client: OpenMeteoClient) -> float | None:
     """Fetch the latest planetary Kp, returning None on any failure.
 
@@ -907,23 +942,97 @@ def drone_flight_summary(
     if profile is None:
         return Answer(describe_supported_drones(DRONE_PROFILES))
     reference = now if now is not None else datetime.now(_UK_TIMEZONE).replace(tzinfo=None)
-    site = site_clients if site_clients is not None else SiteClients()
-    owns_aviation = site.aviation is None
-    aviation = site.aviation if site.aviation is not None else AviationClient()
-    owns_openaip = site.openaip is None
-    openaip = site.openaip if site.openaip is not None else OpenAipClient()
 
-    def describe(active: OpenMeteoClient, place: GeocodeResult) -> str:
-        forecast = active.drone_forecast(place.latitude, place.longitude, _DRONE_FORECAST_DAYS)
-        kp_by_time = _drone_kp_by_hour(active, forecast.hours)
-        briefing = _site_briefing(active, aviation, openaip, place)
-        assessment = assess_forecast(profile, forecast, _place_label(place), kp_by_time, reference)
-        return _drone_report(assessment, profile, briefing)
+    with _open_site_clients(site_clients) as (aviation, openaip):
 
-    try:
+        def describe(active: OpenMeteoClient, place: GeocodeResult) -> str:
+            forecast = active.drone_forecast(place.latitude, place.longitude, _DRONE_FORECAST_DAYS)
+            kp_by_time = _drone_kp_by_hour(active, forecast.hours)
+            briefing = _site_briefing(active, aviation, openaip, place)
+            assessment = assess_forecast(
+                profile, forecast, _place_label(place), kp_by_time, reference
+            )
+            return _drone_report(assessment, profile, briefing)
+
         return _summarize(location, client, describe)
-    finally:
-        if owns_aviation:
-            aviation.close()
-        if owns_openaip:
-            openaip.close()
+
+
+def _fleet_report(
+    members: tuple[FleetMember, ...],
+    place_label: str,
+    briefing: SiteBriefing,
+) -> str:
+    """Render the fleet assessment with shared tips, applying the safety audit."""
+    factors = " ".join(
+        factor
+        for member in members
+        for hour in member.assessment.hours
+        for factor in hour.limiting_factors
+    )
+    tips = retrieve(factors or "pre-flight wind battery", load_sections())
+    report = describe_fleet_assessment(members, place_label, tips, briefing)
+    if any(audit_drone_report(member.assessment, report) for member in members):
+        return f"{_SAFETY_BANNER}\n\n{report}"
+    return report
+
+
+def _fleet_members(
+    active: OpenMeteoClient,
+    place: GeocodeResult,
+    aviation: AviationClient,
+    openaip: OpenAipClient,
+    reference: datetime,
+) -> tuple[tuple[FleetMember, ...], str, SiteBriefing]:
+    """Assess every supported drone against one shared forecast, Kp, and briefing."""
+    forecast = active.drone_forecast(place.latitude, place.longitude, _DRONE_FORECAST_DAYS)
+    kp_by_time = _drone_kp_by_hour(active, forecast.hours)
+    briefing = _site_briefing(active, aviation, openaip, place)
+    label = _place_label(place)
+    members = tuple(
+        FleetMember(
+            profile=profile,
+            assessment=assess_forecast(profile, forecast, label, kp_by_time, reference),
+            guidance=caa_guidance(profile),
+        )
+        for profile in DRONE_PROFILES
+    )
+    return members, label, briefing
+
+
+def fleet_flight_summary(
+    location: str,
+    client: OpenMeteoClient | None = None,
+    now: datetime | None = None,
+    site_clients: SiteClients | None = None,
+) -> LookupOutcome:
+    """Assess flying every supported drone at a location in one combined report.
+
+    Fetches the drone-tuned hourly forecast, planetary Kp, and site briefing once,
+    then runs the flyability rules for each supported drone against that shared
+    data. A single request covers the whole fleet, so the agent need not call the
+    per-drone tool repeatedly (which small models do unreliably), and the forecast
+    is fetched once rather than per drone.
+
+    UK-scoped like :func:`drone_flight_summary`: forecast hours are UK-local and
+    the CAA guidance follows UK open-category rules.
+
+    Args:
+        location: A city or place name.
+        client: Optional client to use.
+        now: Current naive UK-local time; defaults to the actual current time.
+            Hours before this are excluded so the outlook starts from now.
+        site_clients: Optional injected aviation/airspace clients (tests pass
+            mocks); created internally and closed afterwards when omitted.
+
+    Returns:
+        An outcome wrapping a compact fleet assessment over all supported drones.
+    """
+    reference = now if now is not None else datetime.now(_UK_TIMEZONE).replace(tzinfo=None)
+
+    with _open_site_clients(site_clients) as (aviation, openaip):
+
+        def describe(active: OpenMeteoClient, place: GeocodeResult) -> str:
+            members, label, briefing = _fleet_members(active, place, aviation, openaip, reference)
+            return _fleet_report(members, label, briefing)
+
+        return _summarize(location, client, describe)
