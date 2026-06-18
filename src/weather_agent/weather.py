@@ -11,7 +11,7 @@ callers can compose outcomes safely. The tool layer renders the outcome to text.
 from __future__ import annotations
 
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime
 from typing import TYPE_CHECKING
 from zoneinfo import ZoneInfo
@@ -27,6 +27,7 @@ from weather_agent.drone_report import (
     describe_drone_assessment,
     describe_fleet_assessment,
     describe_supported_drones,
+    reconcile_metar,
 )
 from weather_agent.evaluation import audit_drone_report
 from weather_agent.flyability import assess_forecast
@@ -66,6 +67,7 @@ if TYPE_CHECKING:
         DayAlmanac,
         DroneAssessment,
         DroneFlightHour,
+        DroneForecast,
         DroneProfile,
         GeocodeResult,
         KpForecastEntry,
@@ -1045,6 +1047,46 @@ def _site_briefing(
     )
 
 
+def _hour_to_utc(time: str) -> datetime | None:
+    """Read a UK-local naive forecast timestamp as an aware UTC datetime."""
+    try:
+        return datetime.fromisoformat(time).replace(tzinfo=_UK_TIMEZONE).astimezone(UTC)
+    except ValueError:
+        return None
+
+
+def _nearest_forecast_hour(
+    hours: tuple[DroneFlightHour, ...],
+    observed: str,
+) -> DroneFlightHour | None:
+    """Pick the forecast hour closest in time to a METAR observation (both in UTC)."""
+    try:
+        target = datetime.fromisoformat(observed).replace(tzinfo=UTC)
+    except ValueError:
+        return None
+    nearest: DroneFlightHour | None = None
+    smallest_gap: float | None = None
+    for hour in hours:
+        when = _hour_to_utc(hour.time)
+        if when is None:
+            continue
+        gap = abs((when - target).total_seconds())
+        if smallest_gap is None or gap < smallest_gap:
+            nearest, smallest_gap = hour, gap
+    return nearest
+
+
+def _with_metar_comparison(briefing: SiteBriefing, forecast: DroneForecast) -> SiteBriefing:
+    """Attach an observed-vs-forecast note to the briefing when both are available."""
+    if briefing.metar is None:
+        return briefing
+    hour = _nearest_forecast_hour(forecast.hours, briefing.metar.observed)
+    if hour is None:
+        return briefing
+    note = reconcile_metar(briefing.metar, hour)
+    return briefing if note is None else replace(briefing, metar_vs_forecast=note)
+
+
 def _drone_report(
     assessment: DroneAssessment,
     profile: DroneProfile,
@@ -1099,7 +1141,9 @@ def drone_flight_summary(
         def describe(active: OpenMeteoClient, place: GeocodeResult) -> str:
             forecast = active.drone_forecast(place.latitude, place.longitude, _DRONE_FORECAST_DAYS)
             kp_by_time = _drone_kp_by_hour(active, forecast.hours)
-            briefing = _site_briefing(active, aviation, openaip, place)
+            briefing = _with_metar_comparison(
+                _site_briefing(active, aviation, openaip, place), forecast
+            )
             assessment = assess_forecast(
                 profile, forecast, _place_label(place), kp_by_time, reference
             )
@@ -1137,7 +1181,7 @@ def _fleet_members(
     """Assess every supported drone against one shared forecast, Kp, and briefing."""
     forecast = active.drone_forecast(place.latitude, place.longitude, _DRONE_FORECAST_DAYS)
     kp_by_time = _drone_kp_by_hour(active, forecast.hours)
-    briefing = _site_briefing(active, aviation, openaip, place)
+    briefing = _with_metar_comparison(_site_briefing(active, aviation, openaip, place), forecast)
     label = _place_label(place)
     members = tuple(
         FleetMember(

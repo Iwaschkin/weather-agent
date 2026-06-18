@@ -520,12 +520,15 @@ class SiteBriefing:
         airspace: Nearby drone-relevant airspace volumes to verify before flying.
         airspace_note: A short status line when airspace could not be checked (for
             example no API key configured), or an empty string.
+        metar_vs_forecast: A one-line observed-vs-forecast reconciliation note, or
+            an empty string when there is no METAR or nothing comparable.
     """
 
     sun_times: tuple[DayAlmanac, ...] = ()
     metar: MetarReport | None = None
     airspace: tuple[Airspace, ...] = ()
     airspace_note: str = ""
+    metar_vs_forecast: str = ""
 
 
 @dataclass(frozen=True, slots=True)

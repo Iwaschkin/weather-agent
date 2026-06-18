@@ -12,15 +12,18 @@ from weather_agent.drone_report import (
     describe_drone_assessment,
     describe_fleet_assessment,
     describe_supported_drones,
+    reconcile_metar,
 )
 from weather_agent.knowledge import KnowledgeSection
 from weather_agent.models import (
     DayAlmanac,
     DayOutlook,
     DroneAssessment,
+    DroneFlightHour,
     FleetMember,
     FlightWindow,
     HourAssessment,
+    MetarReport,
     SiteBriefing,
     Verdict,
 )
@@ -72,6 +75,21 @@ _METAR_BODY: list[object] = [
         "wspd": 8,
         "clouds": [{"cover": "FEW", "base": 4000}],
         "rawOb": "EGCC 160900Z 24008KT",
+    },
+]
+# A METAR reporting a gust and visibility, for the observed-vs-forecast check.
+_METAR_WITH_GUST: list[object] = [
+    {
+        "icaoId": "EGCC",
+        "lat": 53.35,
+        "lon": -2.28,
+        "reportTime": "2026-06-16 09:00:00",
+        "wdir": 240,
+        "wspd": 8,
+        "wgst": 25,
+        "visib": 6,
+        "clouds": [{"cover": "FEW", "base": 4000}],
+        "rawOb": "EGCC 160900Z 24008G25KT 6SM",
     },
 ]
 
@@ -364,3 +382,87 @@ def test_fleet_flight_summary_assesses_all_supported_drones() -> None:
     assert summary.count("Nearest METAR") == 1
     assert "MANCHESTER CTR" in summary
     assert summary.count("not legal") == 1
+
+
+def _flight_hour(gust_kmh: float | None, visibility_m: float | None) -> DroneFlightHour:
+    return DroneFlightHour(
+        time="2026-06-16T10:00",
+        temperature_c=16.0,
+        apparent_temperature_c=16.0,
+        wind_gust_10m_kmh=gust_kmh,
+        wind_max_0_500m_kmh=gust_kmh or 0.0,
+        precipitation_mm=0.0,
+        precipitation_probability_pct=0.0,
+        visibility_m=visibility_m,
+        cape=0.0,
+        freezing_level_agl_m=2500.0,
+        is_day=True,
+        cloud_cover_low_pct=10.0,
+    )
+
+
+def _metar(gust_kt: float | None = None, vis_sm: float | None = None) -> MetarReport:
+    return MetarReport(
+        station="EGCC",
+        latitude=53.35,
+        longitude=-2.28,
+        observed="2026-06-16 09:00:00",
+        wind_dir_deg=240.0,
+        wind_speed_kt=8.0,
+        wind_gust_kt=gust_kt,
+        visibility_sm=vis_sm,
+        clouds=(),
+        ceiling_ft_agl=None,
+        raw="EGCC 160900Z",
+    )
+
+
+def test_reconcile_metar_flags_close_gust() -> None:
+    """A gust within tolerance of the forecast gust reads as close."""
+    # 20 kt ~ 10.3 m/s; 36 km/h = 10.0 m/s -> within 2.5 m/s.
+    note = reconcile_metar(_metar(gust_kt=20.0), _flight_hour(36.0, None))
+
+    assert note is not None
+    assert "gusts" in note
+    assert "(close)" in note
+
+
+def test_reconcile_metar_flags_diverging_gust() -> None:
+    """A much stronger observed gust is reported with the direction of the gap."""
+    # 30 kt ~ 15.4 m/s vs 18 km/h = 5 m/s.
+    note = reconcile_metar(_metar(gust_kt=30.0), _flight_hour(18.0, None))
+
+    assert note is not None
+    assert "stronger" in note
+
+
+def test_reconcile_metar_flags_lower_visibility() -> None:
+    """Observed visibility well below the forecast is flagged as lower."""
+    # 3 SM ~ 4.8 km vs 20 km forecast.
+    note = reconcile_metar(_metar(vis_sm=3.0), _flight_hour(None, 20000.0))
+
+    assert note is not None
+    assert "visibility" in note
+    assert "observed lower" in note
+
+
+def test_reconcile_metar_returns_none_when_nothing_comparable() -> None:
+    """With no observed gust and no visibility, there is nothing to reconcile."""
+    assert reconcile_metar(_metar(), _flight_hour(36.0, 20000.0)) is None
+
+
+def test_drone_flight_summary_reconciles_metar_with_forecast() -> None:
+    """A gust-and-visibility METAR yields an observed-vs-forecast line in the report."""
+    summary = render(
+        drone_flight_summary(
+            "Congleton UK",
+            "Mini 5 Pro",
+            client=_drone_client(),
+            now=_NOW,
+            site_clients=_site_clients(_METAR_WITH_GUST, _AIRSPACE_BODY),
+        )
+    )
+
+    assert "Observed vs forecast (now):" in summary
+    assert "gusts" in summary
+    assert "visibility" in summary

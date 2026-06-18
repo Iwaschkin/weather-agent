@@ -19,9 +19,11 @@ if TYPE_CHECKING:
         DayAlmanac,
         DayOutlook,
         DroneAssessment,
+        DroneFlightHour,
         FleetMember,
         FlightWindow,
         HourAssessment,
+        MetarReport,
     )
 
 _DEFAULT_MAX_HOURS = 12
@@ -30,6 +32,14 @@ _VERDICT_LABELS = {
     Verdict.MARGINAL: "MARGINAL",
     Verdict.NO_FLY: "NO-FLY",
 }
+
+_MS_PER_KT = 0.514444
+_KM_PER_SM = 1.60934
+_KMH_PER_MS = 3.6
+# Observed and forecast surface gusts within this many m/s are treated as agreeing.
+_GUST_AGREE_MS = 2.5
+# Observed visibility within this ratio of the forecast (and its inverse) agrees.
+_VIS_AGREE_RATIO = 0.5
 
 
 def _render_best_window(window: FlightWindow | None) -> str:
@@ -52,9 +62,63 @@ def _render_briefing(place_label: str, briefing: SiteBriefing) -> list[str]:
     lines = list(_render_daylight(briefing.sun_times))
     if briefing.metar is not None:
         lines.append(describe_metar(place_label, briefing.metar))
+        if briefing.metar_vs_forecast:
+            lines.append(briefing.metar_vs_forecast)
     if briefing.airspace or briefing.airspace_note:
         lines.append(describe_airspace(place_label, briefing.airspace, briefing.airspace_note))
     return lines
+
+
+def _gust_reconciliation(metar: MetarReport, hour: DroneFlightHour) -> str | None:
+    if metar.wind_gust_kt is None or hour.wind_gust_10m_kmh is None:
+        return None
+    observed = metar.wind_gust_kt * _MS_PER_KT
+    forecast = hour.wind_gust_10m_kmh / _KMH_PER_MS
+    delta = observed - forecast
+    if abs(delta) <= _GUST_AGREE_MS:
+        verdict = "close"
+    else:
+        verdict = f"observed {abs(delta):.0f} m/s {'stronger' if delta > 0 else 'weaker'}"
+    return f"gusts {observed:.0f} m/s observed vs {forecast:.0f} m/s forecast ({verdict})"
+
+
+def _visibility_reconciliation(metar: MetarReport, hour: DroneFlightHour) -> str | None:
+    if metar.visibility_sm is None or hour.visibility_m is None or hour.visibility_m <= 0:
+        return None
+    observed_km = metar.visibility_sm * _KM_PER_SM
+    forecast_km = hour.visibility_m / 1000
+    ratio = observed_km / forecast_km
+    if _VIS_AGREE_RATIO <= ratio <= 1 / _VIS_AGREE_RATIO:
+        verdict = "close"
+    else:
+        verdict = "observed lower" if observed_km < forecast_km else "observed higher"
+    return f"visibility {observed_km:.0f} km observed vs {forecast_km:.0f} km forecast ({verdict})"
+
+
+def reconcile_metar(metar: MetarReport, hour: DroneFlightHour) -> str | None:
+    """Compare like-for-like observed (METAR) and forecast surface values.
+
+    Only quantities measured the same way are compared: the surface 10 m gust
+    (METAR knots vs the forecast's ``wind_gust_10m``) and visibility. The engine's
+    governing wind is a 0-500 m maximum, which is a different quantity from a
+    surface METAR and is deliberately not compared here.
+
+    Args:
+        metar: The nearest observed METAR.
+        hour: The forecast hour nearest the observation time.
+
+    Returns:
+        A one-line "observed vs forecast" note, or ``None`` when nothing is
+        comparable (no gust reported and no visibility on either side).
+    """
+    parts = [
+        note
+        for note in (_gust_reconciliation(metar, hour), _visibility_reconciliation(metar, hour))
+        if note is not None
+    ]
+    if not parts:
+        return None
+    return "Observed vs forecast (now): " + "; ".join(parts) + "."
 
 
 def _render_hour(hour: HourAssessment) -> str:
