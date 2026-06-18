@@ -47,6 +47,7 @@ from weather_agent.reporting import (
     describe_ensemble_spread,
     describe_forecast_day,
     describe_latest_values,
+    describe_location_comparison,
     describe_metar,
     describe_period,
     describe_solar,
@@ -61,6 +62,7 @@ if TYPE_CHECKING:
 
     from weather_agent.models import (
         Airspace,
+        CurrentWeather,
         DayAlmanac,
         DroneAssessment,
         DroneFlightHour,
@@ -724,6 +726,118 @@ def compare_periods(
         return describe_comparison(_place_label(place), label_a, series_a, label_b, series_b)
 
     return _summarize(location, client, describe)
+
+
+@dataclass(frozen=True, slots=True)
+class _LocationMetric:
+    """How to read and rank one current-weather metric across locations.
+
+    Attributes:
+        label: Human-readable metric name used in the heading.
+        unit: Display unit appended to each value; empty when unitless.
+        descending: True when a higher value ranks first (warmest, windiest);
+            False when a lower value ranks first (least cloud / sunniest).
+        read: Reads the metric from a current-weather reading, or None when the
+            API did not supply it.
+    """
+
+    label: str
+    unit: str
+    descending: bool
+    read: Callable[[CurrentWeather], float | None]
+
+
+_LOCATION_METRICS: dict[str, _LocationMetric] = {
+    "temperature": _LocationMetric(
+        "temperature", "°C", descending=True, read=lambda w: w.temperature_celsius
+    ),
+    "wind": _LocationMetric("wind", "km/h", descending=True, read=lambda w: w.wind_speed_kmh),
+    "cloud": _LocationMetric(
+        "cloud cover", "%", descending=False, read=lambda w: w.cloud_cover_pct
+    ),
+    "humidity": _LocationMetric(
+        "humidity", "%", descending=True, read=lambda w: w.relative_humidity_pct
+    ),
+}
+
+
+def _measure_location(
+    active: OpenMeteoClient,
+    location: str,
+    metric: _LocationMetric,
+) -> tuple[str, float] | str:
+    """Resolve one location and read its metric, or return a problem note string."""
+    query = parse_location(location)
+    place = select_best_match(active.geocode(query.name), query.qualifier)
+    if place is None:
+        return f"{location} (not found)"
+    value = metric.read(active.current_weather(place.latitude, place.longitude))
+    if value is None:
+        return f"{_place_label(place)} (no {metric.label})"
+    return (_place_label(place), value)
+
+
+def _collect_rankings(
+    active: OpenMeteoClient,
+    locations: tuple[str, ...],
+    metric: _LocationMetric,
+) -> tuple[list[tuple[str, float]], list[str]]:
+    """Measure each location, splitting results into ranked values and problem notes."""
+    measured: list[tuple[str, float]] = []
+    problems: list[str] = []
+    for location in locations:
+        outcome = _measure_location(active, location, metric)
+        if isinstance(outcome, str):
+            problems.append(outcome)
+        else:
+            measured.append(outcome)
+    return measured, problems
+
+
+def rank_locations(
+    locations: tuple[str, ...],
+    metric: str,
+    client: OpenMeteoClient | None = None,
+) -> LookupOutcome:
+    """Rank several locations by one current-weather metric in a single call.
+
+    Does the multi-location fan-out in code (one geocode + current-weather lookup
+    per place, then a deterministic sort) so the agent need not call a
+    single-location tool once per place and rank the results itself.
+
+    Args:
+        locations: Place names to compare.
+        metric: Metric key to rank by; see :data:`_LOCATION_METRICS`.
+        client: Optional client to use.
+
+    Returns:
+        A ranked comparison answer, an invalid-input outcome for an unknown metric
+        or empty input, a not-found outcome when no location resolved, or a failure
+        outcome when a lookup errors.
+    """
+    spec = _LOCATION_METRICS.get(metric)
+    if spec is None:
+        choices = ", ".join(sorted(_LOCATION_METRICS))
+        return Invalid(f"Unknown comparison metric '{metric}'. Choose from: {choices}.")
+    if not locations:
+        return Invalid("Give at least one location to compare.")
+    owns_client = client is None
+    active = client if client is not None else OpenMeteoClient()
+    try:
+        measured, problems = _collect_rankings(active, locations, spec)
+    except (httpx.HTTPError, ExternalDataError) as error:
+        return Failed("location comparison", str(error))
+    finally:
+        if owns_client:
+            active.close()
+    if not measured:
+        return NotFound("; ".join(locations))
+    measured.sort(key=lambda item: item[1], reverse=spec.descending)
+    order = "highest" if spec.descending else "lowest"
+    heading = f"Location comparison by {spec.label} ({order} first)"
+    return Answer(
+        describe_location_comparison(heading, spec.unit, tuple(measured), tuple(problems))
+    )
 
 
 _DRONE_FORECAST_DAYS = 5

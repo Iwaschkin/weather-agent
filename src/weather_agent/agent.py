@@ -6,6 +6,7 @@ from strands.models.ollama import OllamaModel
 from weather_agent.tools import (
     assess_drone_conditions,
     assess_fleet_conditions,
+    compare_locations,
     compare_weather,
     get_air_quality,
     get_airspace,
@@ -34,7 +35,10 @@ _SYSTEM_PROMPT = (
     "get_historical_weather (past dates, ERA5 from 1940), get_climate_projection "
     "(decade-scale future, CMIP6, to 2050). When the user names a single date and you "
     "are unsure which of those fits, use get_weather, which routes by date. Use "
-    "compare_weather to compare two historical date ranges. For other domains: "
+    "compare_weather to compare two historical date ranges. To compare or rank "
+    "several places by one metric (warmest, windiest, sunniest, most humid), use "
+    "compare_locations rather than calling a single-location tool once per place. "
+    "For other domains: "
     "get_air_quality (pollution and AQI), get_pollen (allergens, Europe), "
     "get_marine_forecast (waves, coastal points), get_river_discharge (flood "
     "indicator), get_ensemble_forecast (forecast uncertainty), get_uv_index (sun "
@@ -85,6 +89,7 @@ def build_agent(
             get_climate_projection,
             get_weather,
             compare_weather,
+            compare_locations,
             get_air_quality,
             get_pollen,
             get_marine_forecast,

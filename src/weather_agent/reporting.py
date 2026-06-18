@@ -371,6 +371,36 @@ def describe_airspace(place_label: str, airspaces: tuple[Airspace, ...], note: s
     return "\n".join(lines)
 
 
+def describe_location_comparison(
+    heading: str,
+    unit: str,
+    ranked: tuple[tuple[str, float], ...],
+    problems: tuple[str, ...] = (),
+) -> str:
+    """Render a ranked, side-by-side comparison of locations by one metric.
+
+    Args:
+        heading: The comparison heading, including the ranking direction (for
+            example ``"Location comparison by temperature (highest first)"``).
+        unit: Unit appended to each value; empty for a unitless metric.
+        ranked: ``(label, value)`` pairs already sorted into ranking order.
+        problems: Notes for locations that could not be ranked (for example not
+            found, or the metric was unavailable).
+
+    Returns:
+        A multi-line ranked list, with a trailing note for any skipped locations.
+    """
+    unit_suffix = f" {unit}" if unit else ""
+    lines = [f"{heading}:"]
+    lines.extend(
+        f"  {position}. {label}: {value:.1f}{unit_suffix}"
+        for position, (label, value) in enumerate(ranked, start=1)
+    )
+    if problems:
+        lines.append(f"Not compared: {'; '.join(problems)}.")
+    return "\n".join(lines)
+
+
 def describe_uv(place_label: str, uv: UvIndex) -> str:
     """Render the UV index now and today's peak with WHO risk bands.
 

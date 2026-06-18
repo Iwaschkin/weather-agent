@@ -23,6 +23,7 @@ from weather_agent.weather import (
     historical_summary,
     marine_summary,
     pollen_summary,
+    rank_locations,
     river_discharge_summary,
     solar_summary,
     sun_times_summary,
@@ -331,6 +332,27 @@ def compare_weather(
             (period_b_start, period_b_end),
         )
     )
+
+
+@tool
+def compare_locations(locations: list[str], metric: str = "temperature") -> str:
+    """Compare current weather across several locations, ranked by one metric.
+
+    Use this when the user asks to compare or rank multiple places (for example
+    "which is warmest: Paris, London, or Berlin?" or "is it sunnier in Madrid or
+    Rome?") instead of calling the single-location tools once per place.
+
+    Args:
+        locations: Place names to compare, for example ["Paris", "London", "Berlin"].
+        metric: What to rank by - one of "temperature" (warmest first), "wind"
+            (windiest first), "cloud" (least cloud, i.e. sunniest, first), or
+            "humidity" (most humid first).
+
+    Returns:
+        A ranked side-by-side comparison, noting any location that could not be
+        resolved or lacked the metric.
+    """
+    return render(rank_locations(tuple(locations), metric))
 
 
 @tool
