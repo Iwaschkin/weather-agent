@@ -20,10 +20,11 @@ shared time-series boundary (`TimeSeries` + `parse_time_series`).
 | `get_climate_projection` | Climate (CMIP6) | Decade-scale projections to 2050 |
 | `get_weather` | routed | Picks archive/forecast/climate by date |
 | `compare_weather` | Archive | Compare two historical date ranges |
+| `compare_locations` | Forecast | Rank several places by warmest/windiest/sunniest/most humid |
 | `get_weather_at_coordinates` | Forecast | Current conditions at a raw latitude/longitude (no geocoding) |
-| `get_air_quality` | Air-Quality | PM2.5, PM10, ozone, European AQI (current hour) |
+| `get_air_quality` | Air-Quality | PM2.5, PM10, ozone, European AQI (current hour), with EEA bands |
 | `get_pollen` | Air-Quality (CAMS) | Grass, tree, and weed pollen (Europe) |
-| `get_marine_forecast` | Marine | Wave height and period (coastal, current hour) |
+| `get_marine_forecast` | Marine | Wave height (WMO sea-state band) and period (coastal, current hour) |
 | `get_river_discharge` | Flood (GloFAS) | River discharge / flood indicator |
 | `get_ensemble_forecast` | Ensemble | Member spread (forecast uncertainty) |
 | `get_uv_index` | Forecast | UV index now and today's peak, with WHO risk bands |
@@ -32,12 +33,28 @@ shared time-series boundary (`TimeSeries` + `parse_time_series`).
 | `get_aviation_weather` | aviationweather.gov | Nearest airport's observed METAR (wind, visibility, ceiling) |
 | `get_airspace` | OpenAIP (key) | Nearby controlled/restricted airspace (decision support) |
 | `get_elevation` | Elevation | Terrain height |
-| `assess_drone_conditions` | Forecast + NOAA Kp + METAR + OpenAIP | Per-hour drone flyability (DJI Neo, Avata 2, Mini 5 Pro) with UK CAA notes |
+| `assess_drone_conditions` | Forecast + NOAA Kp + METAR + OpenAIP | Per-hour flyability for one drone (DJI Neo, Avata 2, Mini 5 Pro) with UK CAA notes |
+| `assess_fleet_conditions` | Forecast + NOAA Kp + METAR + OpenAIP | All supported drones compared side by side in one call |
 | `list_supported_drones` | (none) | The drone models the assessor covers |
 
 Current conditions name the WMO condition (e.g. "light rain") and include humidity,
 dew point, cloud cover, and pressure; the daily forecast adds rain chance and peak
 gust.
+
+A few behaviours cut across the tools:
+
+- **Interpreted bands.** Numbers that have a published scale are labelled, not left
+  raw — e.g. `European AQI 33.0 (fair)`, `UV index 8.1 (very high)`,
+  `Wave height 1.4 m (moderate)` — so the model is handed meaning, not bare figures.
+- **Natural dates.** Date tools accept `today`, `tomorrow`, `in 3 days`,
+  `next friday`, `2 weeks ago`, etc. as well as `YYYY-MM-DD`; the phrase is resolved
+  in code, not by the model.
+- **Multi-place and fleet requests** are single tool calls (`compare_locations`,
+  `assess_fleet_conditions`): the fan-out and ranking happen deterministically
+  rather than relying on the model to call a per-item tool repeatedly.
+
+Every switch, variable, and tunable is catalogued in the
+[Operators Manual](OPERATIONS.md).
 
 ## Drone flying assessment
 
@@ -50,8 +67,14 @@ per-hour planetary Kp forecast into an hour-by-hour `GOOD` / `MARGINAL` /
 `NO-FLY` verdict for a chosen drone, names the limiting factor, finds the best
 flying window, and summarises a per-day outlook over a multi-day horizon. It adds
 UK CAA open-category guidance, the day's sunrise/sunset window, the nearest
-airport's observed METAR (a reality check on the model), and nearby airspace from
+airport's observed METAR (a reality check on the model, reconciled against the
+forecast for like-for-like surface gust and visibility), and nearby airspace from
 OpenAIP, plus matching tips.
+
+`assess_fleet_conditions` runs the same assessment for every supported drone in a
+single call, fetching the forecast once and showing the drones side by side, so
+"how do all my drones look?" does not depend on the model calling the per-drone tool
+three times.
 
 It is decision support, not legal or airworthiness advice. The airspace section is
 **not** authoritative and does **not** cover NOTAMs - always verify with CAA Drone
@@ -68,12 +91,16 @@ Assist / Altitude Angel before flying. The airspace lookup needs an OpenAIP key
 - `weather_agent.aviation` — HTTP boundary for aviationweather.gov METARs (`AviationClient`).
 - `weather_agent.openaip` — HTTP boundary for OpenAIP airspace (`OpenAipClient`, needs a key).
 - `weather_agent.reporting` — pure formatting of time series into readable summaries.
+- `weather_agent.bands` — pure classification of raw readings into labelled bands (UV, air quality, marine).
 - `weather_agent.routing` — pure date-based selection of the right data source.
+- `weather_agent.dates` — pure resolution of natural day phrases ("tomorrow", "next friday") to dates.
 - `weather_agent.drone` — drone model profiles (DJI Neo, Avata 2, Mini 5 Pro) and lookup.
 - `weather_agent.flyability` — pure rules engine turning forecast hours into flight verdicts.
 - `weather_agent.caa` — pure UK CAA open-category guidance and disclaimer.
 - `weather_agent.knowledge` — keyword retrieval over the curated drone knowledge file.
-- `weather_agent.drone_report` — pure formatting of drone flight assessments.
+- `weather_agent.drone_report` — pure formatting of drone flight assessments (single and fleet).
+- `weather_agent.evaluation` — deterministic faithfulness checks and the runtime under-statement guardrail.
+- `weather_agent.eval_llm` — opt-in, offline LLM-as-judge faithfulness scoring (needs Ollama).
 - `weather_agent.weather` — domain logic turning a place name into a readable summary.
 - `weather_agent.results` — typed lookup outcomes (answer/not-found/invalid/failure), rendered to text at the tool boundary.
 - `weather_agent.tools` — the Strands `@tool` wrappers exposing each capability.
@@ -94,10 +121,11 @@ Then run a query:
 
 ```shell
 uv run weather-agent "What is the weather in Tokyo right now?"
-uv run weather-agent "What was the weather in Berlin on 2020-01-01?"
-uv run weather-agent "Compare Madrid summers in 1990 and 2020"
+uv run weather-agent "What will the weather be in Berlin tomorrow?"
+uv run weather-agent "What was the weather in Berlin 2 weeks ago?"
+uv run weather-agent "Which is warmest: Paris, London, or Berlin?"
 uv run weather-agent "What is the air quality in Beijing?"
-uv run weather-agent "Can I fly my DJI Mini 5 Pro in Congleton today?"
+uv run weather-agent "Can I fly all my drones in Congleton this weekend?"
 ```
 
 ### Interactive chat (with memory)
@@ -127,6 +155,12 @@ OPENAIP_API_KEY=your-key-here
 
 The CLI loads `.env` automatically. Without a key, every other tool works
 normally and the airspace lookup degrades to an "unavailable" note.
+
+The model and Ollama host default to `gemma4:12b` / `http://localhost:11434` and are
+changed via `build_agent(host=..., model_id=...)` (there is no CLI flag or
+environment variable for them). For the complete list of variables, tool
+parameters, routing thresholds, drone profiles, band scales, and rules-engine
+tunables, see the [Operators Manual](OPERATIONS.md).
 
 ## Development
 
