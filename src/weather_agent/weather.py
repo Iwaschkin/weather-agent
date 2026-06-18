@@ -21,6 +21,7 @@ import httpx
 from weather_agent.aviation import AviationClient
 from weather_agent.caa import caa_guidance
 from weather_agent.client import OpenMeteoClient
+from weather_agent.dates import resolve_day
 from weather_agent.drone import DRONE_PROFILES, find_profile
 from weather_agent.drone_report import (
     describe_drone_assessment,
@@ -102,6 +103,16 @@ def _place_label(place: GeocodeResult) -> str:
     if place.country:
         parts.append(place.country)
     return ", ".join(parts)
+
+
+def _reference_date(today: date | None) -> date:
+    return today if today is not None else datetime.now(UTC).date()
+
+
+def _resolve_iso(text: str, reference: date) -> str | None:
+    """Resolve an ISO date or single-day phrase to an ISO date string, or None."""
+    resolved = resolve_day(text, reference)
+    return resolved.isoformat() if resolved is not None else None
 
 
 def _summarize(
@@ -220,28 +231,35 @@ def forecast_for_day(
 
 def historical_summary(
     location: str,
-    start_date: str,
-    end_date: str,
+    period: tuple[str, str],
     client: OpenMeteoClient | None = None,
+    today: date | None = None,
 ) -> LookupOutcome:
     """Build a historical (ERA5 archive) summary over a date range.
 
     Args:
         location: A city or place name.
-        start_date: Inclusive ISO-8601 start date (``YYYY-MM-DD``), from 1940.
-        end_date: Inclusive ISO-8601 end date (``YYYY-MM-DD``).
+        period: Inclusive ``(start, end)`` range; each endpoint is an ISO date
+            (``YYYY-MM-DD``, from 1940) or a single-day phrase like ``"yesterday"``.
         client: Optional client to use.
+        today: Reference date for relative phrases; defaults to the current UTC date.
 
     Returns:
-        An outcome wrapping a one-line summary of the range.
+        An outcome wrapping a one-line summary of the range, or an invalid-input
+        outcome when a date cannot be interpreted.
     """
+    reference = _reference_date(today)
+    start_iso = _resolve_iso(period[0], reference)
+    end_iso = _resolve_iso(period[1], reference)
+    if start_iso is None or end_iso is None:
+        return Invalid(f"Could not interpret the date range '{period[0]}' to '{period[1]}'.")
 
     def describe(active: OpenMeteoClient, place: GeocodeResult) -> str:
         request = HistoricalRequest(
             latitude=place.latitude,
             longitude=place.longitude,
-            start_date=start_date,
-            end_date=end_date,
+            start_date=start_iso,
+            end_date=end_iso,
             daily=DAILY_VARIABLES,
         )
         series = active.historical_series(request)
@@ -252,33 +270,40 @@ def historical_summary(
 
 def climate_summary(
     location: str,
-    start_date: str,
-    end_date: str,
+    period: tuple[str, str],
     client: OpenMeteoClient | None = None,
     note: str = "",
+    today: date | None = None,
 ) -> LookupOutcome:
     """Build a climate (CMIP6) projection summary over a date range.
 
     Args:
         location: A city or place name.
-        start_date: Inclusive ISO-8601 start date (``YYYY-MM-DD``), up to 2050.
-        end_date: Inclusive ISO-8601 end date (``YYYY-MM-DD``).
+        period: Inclusive ``(start, end)`` range; each endpoint is an ISO date
+            (``YYYY-MM-DD``, up to 2050) or a single-day phrase.
         client: Optional client to use.
         note: Optional trailing note appended only when an actual projection is
             produced (resolution and fetch succeed and the series has rows). Used
             by date routing to flag that a climate estimate stood in for a
             forecast, without leaking the note onto not-found or failure outcomes.
+        today: Reference date for relative phrases; defaults to the current UTC date.
 
     Returns:
-        An outcome wrapping a one-line summary of the projection.
+        An outcome wrapping a one-line summary of the projection, or an
+        invalid-input outcome when a date cannot be interpreted.
     """
+    reference = _reference_date(today)
+    start_iso = _resolve_iso(period[0], reference)
+    end_iso = _resolve_iso(period[1], reference)
+    if start_iso is None or end_iso is None:
+        return Invalid(f"Could not interpret the date range '{period[0]}' to '{period[1]}'.")
 
     def describe(active: OpenMeteoClient, place: GeocodeResult) -> str:
         request = ClimateRequest(
             latitude=place.latitude,
             longitude=place.longitude,
-            start_date=start_date,
-            end_date=end_date,
+            start_date=start_iso,
+            end_date=end_iso,
             daily=DAILY_VARIABLES,
             models=_DEFAULT_CLIMATE_MODEL,
         )
@@ -614,32 +639,33 @@ def weather_for_date(
 
     Args:
         location: A city or place name.
-        when: The date of interest in ISO format (``YYYY-MM-DD``).
+        when: The date of interest: an ISO date (``YYYY-MM-DD``) or a single-day
+            phrase such as ``"tomorrow"`` or ``"next friday"``.
         client: Optional client to use.
         today: Reference current date; defaults to the current UTC date.
 
     Returns:
         The outcome from the selected source, or an invalid-input outcome when the
-        date cannot be parsed. Beyond the forecast horizon the climate estimate is
-        flagged as such, but only when it is a real projection.
+        date cannot be interpreted. Beyond the forecast horizon the climate estimate
+        is flagged as such, but only when it is a real projection.
     """
-    try:
-        target = date.fromisoformat(when)
-    except ValueError:
-        return Invalid(f"'{when}' is not a valid ISO date (expected YYYY-MM-DD).")
     reference = today if today is not None else datetime.now(UTC).date()
+    target = resolve_day(when, reference)
+    if target is None:
+        return Invalid(f"'{when}' is not a date I can interpret (try YYYY-MM-DD or 'tomorrow').")
+    iso = target.isoformat()
     source = select_data_source(target, reference)
     if source is DataSource.ARCHIVE:
-        return historical_summary(location, when, when, client)
+        return historical_summary(location, (iso, iso), client)
     if source is DataSource.FORECAST:
         # The forecast endpoint serves recent past days too; label those as past
         # weather rather than a forecast.
         heading = "Forecast" if target >= reference else "Weather"
-        return forecast_for_day(location, when, client, heading)
+        return forecast_for_day(location, iso, client, heading)
     # Beyond the forecast horizon there is no real forecast; the note is attached
     # by climate_summary only when an actual projection is produced, so it never
     # leaks onto a not-found or failure outcome.
-    return climate_summary(location, when, when, client, note=_ROUTED_CLIMATE_CAVEAT)
+    return climate_summary(location, (iso, iso), client, note=_ROUTED_CLIMATE_CAVEAT)
 
 
 def compare_periods(
@@ -647,6 +673,7 @@ def compare_periods(
     period_a: tuple[str, str],
     period_b: tuple[str, str],
     client: OpenMeteoClient | None = None,
+    today: date | None = None,
 ) -> LookupOutcome:
     """Compare historical mean daily high temperature between two date ranges.
 
@@ -655,21 +682,31 @@ def compare_periods(
 
     Args:
         location: A city or place name.
-        period_a: Inclusive ``(start_date, end_date)`` ISO range for the baseline.
-        period_b: Inclusive ``(start_date, end_date)`` ISO range to compare.
+        period_a: Inclusive ``(start, end)`` baseline range; each endpoint is an ISO
+            date or a single-day phrase.
+        period_b: Inclusive ``(start, end)`` comparison range (ISO or phrases).
         client: Optional client to use.
+        today: Reference date for relative phrases; defaults to the current UTC date.
 
     Returns:
-        An outcome wrapping a one-line comparison.
+        An outcome wrapping a one-line comparison, or an invalid-input outcome when
+        a date cannot be interpreted.
     """
+    reference = _reference_date(today)
+    a_start = _resolve_iso(period_a[0], reference)
+    a_end = _resolve_iso(period_a[1], reference)
+    b_start = _resolve_iso(period_b[0], reference)
+    b_end = _resolve_iso(period_b[1], reference)
+    if a_start is None or a_end is None or b_start is None or b_end is None:
+        return Invalid("Could not interpret one of the comparison dates.")
 
     def describe(active: OpenMeteoClient, place: GeocodeResult) -> str:
         series_a = active.historical_series(
             HistoricalRequest(
                 latitude=place.latitude,
                 longitude=place.longitude,
-                start_date=period_a[0],
-                end_date=period_a[1],
+                start_date=a_start,
+                end_date=a_end,
                 daily=DAILY_VARIABLES,
             )
         )
@@ -677,13 +714,13 @@ def compare_periods(
             HistoricalRequest(
                 latitude=place.latitude,
                 longitude=place.longitude,
-                start_date=period_b[0],
-                end_date=period_b[1],
+                start_date=b_start,
+                end_date=b_end,
                 daily=DAILY_VARIABLES,
             )
         )
-        label_a = f"{period_a[0]}..{period_a[1]}"
-        label_b = f"{period_b[0]}..{period_b[1]}"
+        label_a = f"{a_start}..{a_end}"
+        label_b = f"{b_start}..{b_end}"
         return describe_comparison(_place_label(place), label_a, series_a, label_b, series_b)
 
     return _summarize(location, client, describe)

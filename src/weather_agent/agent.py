@@ -49,8 +49,9 @@ _SYSTEM_PROMPT = (
     "fleet (do not call the single-drone tool once per drone); use "
     "list_supported_drones to see which models are covered. Always pass on the UK CAA "
     "notes and safety disclaimer, and never present it as legal or airworthiness "
-    "authority. Date-based "
-    "tools take ISO start and end dates (YYYY-MM-DD)."
+    "authority. Date tools accept a natural day phrase ('today', 'tomorrow', 'in 3 "
+    "days', 'next friday') or an ISO date (YYYY-MM-DD); pass the user's wording "
+    "through and let the tool resolve it - do not compute dates yourself."
 )
 _DEFAULT_OLLAMA_HOST = "http://localhost:11434"
 _DEFAULT_MODEL_ID = "gemma4:12b"

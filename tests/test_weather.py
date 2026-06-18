@@ -132,7 +132,7 @@ def test_forecast_summary_lists_days() -> None:
 def test_historical_summary_aggregates_range() -> None:
     """historical_summary reports an aggregate over the date range."""
     summary = render(
-        historical_summary("Berlin", "2020-01-01", "2020-01-02", client=_daily_client())
+        historical_summary("Berlin", ("2020-01-01", "2020-01-02"), client=_daily_client())
     )
 
     assert "Historical weather for Berlin, Germany" in summary
@@ -141,7 +141,9 @@ def test_historical_summary_aggregates_range() -> None:
 
 def test_climate_summary_aggregates_range() -> None:
     """climate_summary reports an aggregate over the projection range."""
-    summary = render(climate_summary("Berlin", "2040-01-01", "2040-12-31", client=_daily_client()))
+    summary = render(
+        climate_summary("Berlin", ("2040-01-01", "2040-12-31"), client=_daily_client())
+    )
 
     assert "Climate projection for Berlin, Germany" in summary
     assert "total precipitation 4.2 mm" in summary
@@ -190,11 +192,38 @@ def test_weather_for_date_routes_recent_past_to_forecast() -> None:
     assert "Forecast for" not in summary
 
 
-def test_weather_for_date_rejects_invalid_date() -> None:
-    """A malformed date yields an explanatory message, not an exception."""
+def test_weather_for_date_rejects_uninterpretable_date() -> None:
+    """An unrecognised date phrase yields an explanatory message, not an exception."""
     summary = render(weather_for_date("Berlin", "not-a-date", client=_daily_client()))
 
-    assert "not a valid ISO date" in summary
+    assert "is not a date I can interpret" in summary
+
+
+def test_weather_for_date_accepts_relative_phrase() -> None:
+    """A 'tomorrow' phrase resolves and routes to the near-future forecast."""
+    summary = render(
+        weather_for_date("Berlin", "tomorrow", client=_daily_client(), today=date(2026, 6, 16))
+    )
+
+    assert "Forecast for Berlin, Germany on" in summary
+
+
+def test_historical_summary_accepts_relative_range() -> None:
+    """Relative range endpoints resolve before the archive lookup."""
+    summary = render(
+        historical_summary(
+            "Berlin", ("7 days ago", "yesterday"), client=_daily_client(), today=date(2026, 6, 16)
+        )
+    )
+
+    assert "Historical weather for Berlin, Germany" in summary
+
+
+def test_historical_summary_rejects_uninterpretable_range() -> None:
+    """An unrecognised range phrase is reported, not silently fetched."""
+    summary = render(historical_summary("Berlin", ("last summer", "now"), client=_daily_client()))
+
+    assert "Could not interpret the date range" in summary
 
 
 def test_weather_for_date_far_future_flags_climate_estimate() -> None:

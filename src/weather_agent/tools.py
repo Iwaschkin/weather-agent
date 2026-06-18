@@ -68,14 +68,15 @@ def get_historical_weather(location: str, start_date: str, end_date: str) -> str
 
     Args:
         location: A city or place name, for example "Berlin" or "Tokyo".
-        start_date: Inclusive start date in ISO format (YYYY-MM-DD).
-        end_date: Inclusive end date in ISO format (YYYY-MM-DD).
+        start_date: Inclusive start date - an ISO date (YYYY-MM-DD) or a day phrase
+            like "yesterday" or "3 days ago".
+        end_date: Inclusive end date (ISO date or a day phrase).
 
     Returns:
         A summary of temperature extremes and total precipitation over the range,
         or an explanatory message when the location cannot be resolved.
     """
-    return render(historical_summary(location, start_date, end_date))
+    return render(historical_summary(location, (start_date, end_date)))
 
 
 @tool
@@ -87,14 +88,14 @@ def get_climate_projection(location: str, start_date: str, end_date: str) -> str
 
     Args:
         location: A city or place name, for example "Berlin" or "Tokyo".
-        start_date: Inclusive start date in ISO format (YYYY-MM-DD).
-        end_date: Inclusive end date in ISO format (YYYY-MM-DD).
+        start_date: Inclusive start date - an ISO date (YYYY-MM-DD) or a day phrase.
+        end_date: Inclusive end date (ISO date or a day phrase).
 
     Returns:
         A summary of projected temperature extremes and total precipitation, or an
         explanatory message when the location cannot be resolved.
     """
-    return render(climate_summary(location, start_date, end_date))
+    return render(climate_summary(location, (start_date, end_date)))
 
 
 @tool
@@ -291,7 +292,9 @@ def get_weather(location: str, when: str) -> str:
 
     Args:
         location: A city or place name, for example "Berlin" or "Tokyo".
-        when: The date of interest in ISO format (YYYY-MM-DD).
+        when: The date of interest - an ISO date (YYYY-MM-DD) or a natural day
+            phrase like "today", "tomorrow", "in 3 days", or "next friday". Pass
+            the user's wording straight through; do not convert it yourself.
 
     Returns:
         A weather summary drawn from the appropriate data source, or an
@@ -312,10 +315,10 @@ def compare_weather(
 
     Args:
         location: A city or place name, for example "Berlin" or "Tokyo".
-        period_a_start: Inclusive ISO start date of the baseline period.
-        period_a_end: Inclusive ISO end date of the baseline period.
-        period_b_start: Inclusive ISO start date of the comparison period.
-        period_b_end: Inclusive ISO end date of the comparison period.
+        period_a_start: Baseline start - an ISO date or a day phrase.
+        period_a_end: Baseline end (ISO date or a day phrase).
+        period_b_start: Comparison start (ISO date or a day phrase).
+        period_b_end: Comparison end (ISO date or a day phrase).
 
     Returns:
         A one-line comparison of mean daily high temperature with the delta, or an
