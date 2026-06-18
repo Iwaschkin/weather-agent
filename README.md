@@ -1,14 +1,18 @@
 # weather-agent
 
-A [Strands](https://github.com/strands-agents/sdk-python) agent that answers
-weather, climate, and environmental questions, primarily using the free
-[open-meteo.com](https://open-meteo.com) APIs (no key needed). It also draws on
-NOAA space weather and aviationweather.gov (both key-free); only the airspace tool
-needs a key (see [Configuration](#configuration)).
+A [Strands](https://github.com/strands-agents/sdk-python) agent over the free
+[open-meteo.com](https://open-meteo.com) APIs (plus key-free NOAA space weather and
+aviationweather.gov METARs) that answers weather, climate, and environmental
+questions and — its centrepiece — gives **drone-flyability decision support**, both
+on the command line and through a graphical [web dashboard](#web-dashboard). Only the
+airspace tool needs a key (see [Configuration](#configuration)).
 
-It is a technical demonstrator: open-meteo is really several APIs that share one
-request/response grammar, so each capability is one Strands tool built on a single
-shared time-series boundary (`TimeSeries` + `parse_time_series`).
+It is a technical demonstrator on two levels. open-meteo is really several APIs that
+share one request/response grammar, so each capability is one Strands tool built on a
+single shared time-series boundary (`TimeSeries` + `parse_time_series`). And the drone
+assessment follows a "symbolic decides, LLM explains" design: a deterministic rules
+engine owns the `GOOD` / `MARGINAL` / `NO-FLY` verdict, raw numbers are grounded in
+labelled bands, and a faithfulness guardrail stops the model under-stating the risk.
 
 ## Tools
 
