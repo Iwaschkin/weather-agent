@@ -1,0 +1,5 @@
+# Reflex build/runtime artifacts
+.web/
+*.db
+assets/external/
+__pycache__/

@@ -29,6 +29,9 @@ dev = [
     "pytest-cov>=7.1.0",
     "ruff>=0.15.17",
 ]
+web = [
+    "reflex>=0.9.5.post2",
+]
 
 [tool.ruff]
 # Explicit line length to avoid relying on defaults and to align CI/editor behaviour
@@ -36,7 +39,9 @@ line-length = 100
 # The Reflex web app (web/) is a thin UI layer outside the strict src/ baseline:
 # its component/state DSL fights strict typing, and it is already outside Pyright's
 # include. Exclude it from the core lint rather than weakening any rule for src/.
+# force-exclude keeps it excluded even when pre-commit passes explicit file paths.
 extend-exclude = ["web"]
+force-exclude = true
 
 [tool.ruff.lint]
 select = [

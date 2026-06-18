@@ -376,3 +376,29 @@ uv run pytest           # tests + coverage
 
 Per-file rule relaxations: `print` is allowed in `cli.py` only; tests drop
 `S101`/`PLR2004`/`S105`/`S106`. See `AGENTS.md` for the full policy.
+
+---
+
+## 16. Web dashboard (`web/`)
+
+An optional [Reflex](https://reflex.dev) UI over `assess_fleet` and
+`generate_drone_report`. It is a separate app outside the strict `src/` baseline
+(`web/` is ruff-excluded and outside the Pyright include).
+
+| Knob | Where | Default | Effect |
+| --- | --- | --- | --- |
+| `web` dependency group | `pyproject.toml` | `reflex` | Installed with `uv sync --group web`; not part of the core runtime. |
+| `app_name` | `web/rxconfig.py` | `weather_dashboard` | Reflex resolves the app from `weather_dashboard/weather_dashboard.py`. |
+| `days` selector | `web/.../components.py` | 1–7 (default 5) | Forecast horizon; passed to `assess_fleet`, capped at `_MAX_DRONE_FORECAST_DAYS`. |
+| `metric` toggle | dashboard UI | `wind` | Charted metric: `wind` (with limit line), `precip`, `temp`, `vis`. |
+| theme | `web/.../weather_dashboard.py` | dark / cyan | `rx.theme(appearance=..., accent_color=...)`; edit to restyle. |
+| LLM host/model | `reporting_llm` defaults | `http://localhost:11434` / `gemma4:12b` | The dashboard calls `generate_drone_report` with the module defaults; needs Ollama running for the AI briefing (charts work without it). |
+
+Run it:
+
+```shell
+uv sync --group web
+cd web && uv run reflex run     # http://localhost:3000
+```
+
+The first run downloads the frontend toolchain (bun) and compiles, so it is slower.

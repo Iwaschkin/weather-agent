@@ -101,6 +101,7 @@ Assist / Altitude Angel before flying. The airspace lookup needs an OpenAIP key
 - `weather_agent.drone_report` — pure formatting of drone flight assessments (single and fleet).
 - `weather_agent.evaluation` — deterministic faithfulness checks and the runtime under-statement guardrail.
 - `weather_agent.eval_llm` — opt-in, offline LLM-as-judge faithfulness scoring (needs Ollama).
+- `weather_agent.reporting_llm` — grounded, audited LLM-written drone reports (needs Ollama).
 - `weather_agent.weather` — domain logic turning a place name into a readable summary.
 - `weather_agent.results` — typed lookup outcomes (answer/not-found/invalid/failure), rendered to text at the tool boundary.
 - `weather_agent.tools` — the Strands `@tool` wrappers exposing each capability.
@@ -161,6 +162,23 @@ changed via `build_agent(host=..., model_id=...)` (there is no CLI flag or
 environment variable for them). For the complete list of variables, tool
 parameters, routing thresholds, drone profiles, band scales, and rules-engine
 tunables, see the [Operators Manual](OPERATIONS.md).
+
+## Web dashboard
+
+A [Reflex](https://reflex.dev) dashboard in [`web/`](web/) gives the drone
+assessment a graphical UI: pick a location and a horizon of up to 7 days, and see a
+per-drone flyability chart (wind/precip/temp/visibility) with a GOOD/MARGINAL/NO-FLY
+ribbon and an AI-generated briefing per drone. It is a thin layer over
+`weather_agent.assess_fleet` (structured forecast) and
+`weather_agent.reporting_llm.generate_drone_report` (the grounded LLM report).
+
+```shell
+uv sync --group web
+cd web && uv run reflex run     # then open http://localhost:3000
+```
+
+The charts work without Ollama; the AI briefing needs a running Ollama server
+(`ollama serve`, model pulled). See [`web/README.md`](web/README.md) for details.
 
 ## Development
 
