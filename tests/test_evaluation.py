@@ -12,9 +12,9 @@ from dataclasses import replace
 import pytest
 
 from weather_agent.drone import MINI_5_PRO
-from weather_agent.evaluation import check_hour_explanation
+from weather_agent.evaluation import audit_drone_report, check_hour_explanation
 from weather_agent.flyability import assess_hour
-from weather_agent.models import DroneFlightHour, Verdict
+from weather_agent.models import DroneAssessment, DroneFlightHour, HourAssessment, Verdict
 
 _SEVERITY = {Verdict.GOOD: 0, Verdict.MARGINAL: 1, Verdict.NO_FLY: 2}
 
@@ -107,3 +107,22 @@ def test_grounding_restrictive_phrasing_is_not_understating(phrase: str) -> None
     result = check_hour_explanation(f"Gusts are high; {phrase}, not good to fly.", hour)
 
     assert not result.understates_risk
+
+
+def _no_fly_assessment() -> DroneAssessment:
+    hour = HourAssessment("2026-06-16T11:00", Verdict.NO_FLY, ("gusts over the limit",), None)
+    return DroneAssessment("DJI Neo", "Site", (hour,), None)
+
+
+def test_audit_flags_an_understated_report() -> None:
+    """The report audit fires when prose downgrades a no-fly hour."""
+    problems = audit_drone_report(_no_fly_assessment(), "Great weather today, good to fly all day!")
+
+    assert problems  # one entry for the under-stated hour
+
+
+def test_audit_passes_a_faithful_report() -> None:
+    """A report that conveys the no-fly verdict raises no audit problems."""
+    report = "Hourly outlook:\n  2026-06-16T11:00  NO-FLY - gusts over the limit."
+
+    assert audit_drone_report(_no_fly_assessment(), report) == ()

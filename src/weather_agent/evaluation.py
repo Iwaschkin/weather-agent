@@ -22,7 +22,7 @@ from typing import TYPE_CHECKING
 from weather_agent.models import Verdict
 
 if TYPE_CHECKING:
-    from weather_agent.models import HourAssessment
+    from weather_agent.models import DroneAssessment, HourAssessment
 
 # Keywords that show a gate's metric is actually referenced in the prose. A
 # limiting metric whose keywords are all absent is an ungrounded omission.
@@ -109,4 +109,28 @@ def check_hour_explanation(explanation: str, hour: HourAssessment) -> GroundingR
         grounded=not understates and not missing,
         understates_risk=understates,
         missing_factors=missing,
+    )
+
+
+def audit_drone_report(assessment: DroneAssessment, report: str) -> tuple[str, ...]:
+    """Flag any assessed hour whose verdict the report text under-states.
+
+    A runtime safety net for the "symbolic decides, LLM explains" contract: the
+    rendered drone report is deterministic and faithful today, so this normally
+    returns nothing, but it catches a future renderer (or an LLM relay layer)
+    that downgrades a restrictive verdict. The caller can then warn rather than
+    emit a misleading report.
+
+    Args:
+        assessment: The engine's assessment (the decision ground truth).
+        report: The explanation text about to be shown.
+
+    Returns:
+        One ``"<time> (<verdict>)"`` entry per under-stated hour; empty when the
+        report conveys every restrictive verdict.
+    """
+    return tuple(
+        f"{hour.time} ({hour.verdict.value})"
+        for hour in assessment.hours
+        if check_hour_explanation(report, hour).understates_risk
     )

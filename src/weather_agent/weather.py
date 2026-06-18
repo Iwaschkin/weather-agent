@@ -22,6 +22,7 @@ from weather_agent.caa import caa_guidance
 from weather_agent.client import OpenMeteoClient
 from weather_agent.drone import DRONE_PROFILES, find_profile
 from weather_agent.drone_report import describe_drone_assessment, describe_supported_drones
+from weather_agent.evaluation import audit_drone_report
 from weather_agent.flyability import assess_forecast
 from weather_agent.geocoding import parse_location, select_best_match
 from weather_agent.knowledge import load_sections, retrieve
@@ -55,7 +56,9 @@ if TYPE_CHECKING:
     from weather_agent.models import (
         Airspace,
         DayAlmanac,
+        DroneAssessment,
         DroneFlightHour,
+        DroneProfile,
         GeocodeResult,
         KpForecastEntry,
         MetarReport,
@@ -683,6 +686,10 @@ def compare_periods(
 
 _DRONE_FORECAST_DAYS = 5
 _UK_TIMEZONE = ZoneInfo("Europe/London")
+_SAFETY_BANNER = (
+    "WARNING: an automated check found this assessment may under-state the risk. "
+    "Treat any hour as NO-FLY if in doubt and verify conditions yourself."
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -836,6 +843,36 @@ def _drone_kp_by_hour(
     return {hour.time: current for hour in hours} if current is not None else None
 
 
+def _site_briefing(
+    active: OpenMeteoClient,
+    aviation: AviationClient,
+    openaip: OpenAipClient,
+    place: GeocodeResult,
+) -> SiteBriefing:
+    """Gather best-effort sun times, METAR, and airspace context for a site."""
+    airspaces, airspace_note = _best_effort_airspace(openaip, place.latitude, place.longitude)
+    return SiteBriefing(
+        sun_times=_best_effort_almanac(active, place.latitude, place.longitude),
+        metar=_best_effort_metar(aviation, place.latitude, place.longitude),
+        airspace=airspaces,
+        airspace_note=airspace_note,
+    )
+
+
+def _drone_report(
+    assessment: DroneAssessment,
+    profile: DroneProfile,
+    briefing: SiteBriefing,
+) -> str:
+    """Render the assessment with tips, applying the under-statement safety audit."""
+    factors = " ".join(factor for hour in assessment.hours for factor in hour.limiting_factors)
+    tips = retrieve(factors or "pre-flight wind battery", load_sections())
+    report = describe_drone_assessment(assessment, caa_guidance(profile), tips, briefing)
+    if audit_drone_report(assessment, report):
+        return f"{_SAFETY_BANNER}\n\n{report}"
+    return report
+
+
 def drone_flight_summary(
     location: str,
     drone: str,
@@ -879,17 +916,9 @@ def drone_flight_summary(
     def describe(active: OpenMeteoClient, place: GeocodeResult) -> str:
         forecast = active.drone_forecast(place.latitude, place.longitude, _DRONE_FORECAST_DAYS)
         kp_by_time = _drone_kp_by_hour(active, forecast.hours)
-        airspaces, airspace_note = _best_effort_airspace(openaip, place.latitude, place.longitude)
-        briefing = SiteBriefing(
-            sun_times=_best_effort_almanac(active, place.latitude, place.longitude),
-            metar=_best_effort_metar(aviation, place.latitude, place.longitude),
-            airspace=airspaces,
-            airspace_note=airspace_note,
-        )
+        briefing = _site_briefing(active, aviation, openaip, place)
         assessment = assess_forecast(profile, forecast, _place_label(place), kp_by_time, reference)
-        factors = " ".join(factor for hour in assessment.hours for factor in hour.limiting_factors)
-        tips = retrieve(factors or "pre-flight wind battery", load_sections())
-        return describe_drone_assessment(assessment, caa_guidance(profile), tips, briefing)
+        return _drone_report(assessment, profile, briefing)
 
     try:
         return _summarize(location, client, describe)
