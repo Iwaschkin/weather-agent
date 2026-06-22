@@ -27,6 +27,7 @@ from weather_agent.weather import (
     river_discharge_summary,
     solar_summary,
     sun_times_summary,
+    taf_summary,
     uv_index_summary,
     weather_for_date,
 )
@@ -249,6 +250,25 @@ def get_aviation_weather(location: str) -> str:
         message when none is found or the location cannot be resolved.
     """
     return render(aviation_summary(location))
+
+
+@tool
+def get_nearest_taf(location: str) -> str:
+    """Get the nearest airfield's aviation forecast (TAF) for a location.
+
+    A TAF is the aviation *forecast* for the nearest reporting airfield (wind,
+    visibility, significant weather over a validity window), an independent
+    cross-check against the model's gridded forecast - the forecast companion to
+    ``get_aviation_weather``'s observed METAR.
+
+    Args:
+        location: A city or place name, for example "Manchester".
+
+    Returns:
+        A summary of the nearest station's TAF, or an explanatory message when none
+        is found or the location cannot be resolved.
+    """
+    return render(taf_summary(location))
 
 
 @tool

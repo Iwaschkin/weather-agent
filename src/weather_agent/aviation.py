@@ -13,12 +13,13 @@ from typing import TYPE_CHECKING
 
 import httpx
 
-from weather_agent.parsing import parse_metars
+from weather_agent.parsing import parse_metars, parse_tafs
 
 if TYPE_CHECKING:
-    from weather_agent.models import MetarReport
+    from weather_agent.models import MetarReport, TafReport
 
 _METAR_URL = "https://aviationweather.gov/api/data/metar"
+_TAF_URL = "https://aviationweather.gov/api/data/taf"
 _DEFAULT_TIMEOUT = 10.0
 # Half-extent of the bounding box searched around the point, in degrees
 # (~111 km), wide enough to catch a reporting airfield for most inhabited places.
@@ -78,6 +79,43 @@ class AviationClient:
         response = self._client.get(_METAR_URL, params={"format": "json", "bbox": bbox})
         _ = response.raise_for_status()
         reports = parse_metars(response.json())
+        if not reports:
+            return None
+        return min(
+            reports,
+            key=lambda report: _haversine_km(
+                latitude, longitude, report.latitude, report.longitude
+            ),
+        )
+
+    def nearest_taf(
+        self,
+        latitude: float,
+        longitude: float,
+        search_degrees: float = _DEFAULT_SEARCH_DEGREES,
+    ) -> TafReport | None:
+        """Fetch the nearest reporting station's TAF (aviation forecast) to a coordinate.
+
+        Args:
+            latitude: Latitude in decimal degrees.
+            longitude: Longitude in decimal degrees.
+            search_degrees: Half-extent of the search box around the point.
+
+        Returns:
+            The closest station's forecast, or ``None`` when no station reports
+            within the search box.
+
+        Raises:
+            httpx.HTTPError: If the request fails or returns an error status.
+            AviationError: If the response is not a JSON array.
+        """
+        bbox = (
+            f"{latitude - search_degrees},{longitude - search_degrees},"
+            f"{latitude + search_degrees},{longitude + search_degrees}"
+        )
+        response = self._client.get(_TAF_URL, params={"format": "json", "bbox": bbox})
+        _ = response.raise_for_status()
+        reports = parse_tafs(response.json())
         if not reports:
             return None
         return min(

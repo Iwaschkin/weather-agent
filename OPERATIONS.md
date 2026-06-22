@@ -14,8 +14,9 @@ There are three kinds of knob, and this manual is organised around the distincti
    the change; no reinstall needed for an editable source tree). Each is listed with
    its file, default, and effect.
 
-There is **no** settings file, no CLI flags beyond the `chat` subcommand, and no
-environment variable for the model or host (see [LLM / Ollama](#3-llm--ollama-weather_agentagent)).
+There is **no** settings file, no CLI flags beyond the `chat` and `benchmark`
+subcommands, and no environment variable for the model or host (see
+[LLM / Ollama](#3-llm--ollama-weather_agentagent)).
 
 ---
 
@@ -25,12 +26,18 @@ environment variable for the model or host (see [LLM / Ollama](#3-llm--ollama-we
 | --- | --- |
 | `uv run weather-agent "<prompt>"` | One-shot: all arguments are joined into a single prompt, answered once with a fresh agent (no retained memory). |
 | `uv run weather-agent chat` | Interactive multi-turn session; one agent instance is reused so conversation history carries context across turns. |
+| `uv run weather-agent benchmark` | Runs the cost / tool-routing benchmark over a fixed query set, prints the aggregate summary, and writes a timestamped JSON report under `benchmarks/`. Needs a running Ollama server. |
+| `uv run weather-agent benchmark compare <a.json> <b.json>` | Prints a metric-by-metric comparison (tokens, latency, per-tool routing) of two saved reports. No Ollama needed. |
+| `uv run weather-agent benchmark markdown <report.json>` | Prints a saved report rendered as a markdown table. No Ollama needed. |
 | `uv run weather-agent` | No arguments → uses the default prompt below. |
 
 | Constant | File | Default | Effect |
 | --- | --- | --- | --- |
 | `_DEFAULT_PROMPT` | `cli.py` | `"What is the current weather in Berlin?"` | Used when no prompt arguments are given. |
 | `_CHAT_COMMAND` | `cli.py` | `"chat"` | The first argument that triggers chat mode. |
+| `_BENCHMARK_COMMAND` | `cli.py` | `"benchmark"` | The first argument that triggers the benchmark. |
+| `_BENCHMARK_DIR` | `cli.py` | `benchmarks/` | Directory the `benchmark` subcommand writes JSON reports into (created if missing). |
+| `_TRACE_ENV_VAR` | `cli.py` | `"WEATHER_AGENT_TRACE"` | Name of the env var that, when set, enables console tracing. |
 | `_EXIT_COMMANDS` | `cli.py` | `exit`, `quit`, `:q` | Chat inputs that end the session (case-insensitive). Ctrl-C and EOF also exit. |
 | log level | `cli.py` | `logging.WARNING` | Set once via `logging.basicConfig`. There is no flag; edit the call to raise/lower verbosity. |
 
@@ -45,13 +52,15 @@ Requires a reachable Ollama server (the agent calls a local LLM). The CLI loads
 | --- | --- | --- | --- | --- |
 | `OPENAIP_API_KEY` | No | `""` (empty) | `OpenAipClient` (`openaip.py`) | Enables the airspace lookup (`get_airspace` and the drone assessment's airspace section). Without it, `has_key` is `False` and airspace degrades to an "unavailable" note; everything else works. |
 | `WEATHER_AGENT_LLM_EVAL` | No | unset | `tests/test_eval_llm.py` | Set to `"1"` to run the opt-in live LLM-as-judge test (needs a running Ollama). Any other value (or unset) skips it. Does not affect the application itself. |
+| `WEATHER_AGENT_TRACE` | No | unset | `cli.py` (`tracing.enable_console_tracing`) | Set to any non-empty value to print OpenTelemetry spans (event-loop cycles, model calls, tool calls) to the console for each run. Unset disables tracing. |
 
 Notes:
 
 - The CLI calls `load_dotenv()`, so variables in a git-ignored `.env` file are picked
   up. Copy `.env.example` to `.env` to set `OPENAIP_API_KEY`. **Never commit `.env`.**
 - Time zones come from the `tzdata` package (a dependency), so no system tz database
-  is required. Drone forecasts and CAA guidance use `Europe/London` (see below).
+  is required. Drone forecast hours use the resolved location's own timezone (from
+  the geocoder), while the CAA guidance stays UK open-category regardless.
 
 ---
 
@@ -63,9 +72,10 @@ them, either edit the constants or call `build_agent` from your own code.
 
 | Constant / parameter | File | Default | Effect |
 | --- | --- | --- | --- |
-| `_DEFAULT_OLLAMA_HOST` / `build_agent(host=...)` | `agent.py` | `http://localhost:11434` | Base URL of the Ollama server. |
-| `_DEFAULT_MODEL_ID` / `build_agent(model_id=...)` | `agent.py` | `gemma4:12b` | Ollama model tag. Must be pulled first (`ollama pull <tag>`). |
-| `_SYSTEM_PROMPT` | `agent.py` | (long string) | The agent's system prompt: tool-selection guidance, drone/CAA framing, and the date-phrase instruction. Edit to change tool routing behaviour. |
+| `DEFAULT_OLLAMA_HOST` / `build_agent(host=...)` | `agent.py` | `http://localhost:11434` | Base URL of the Ollama server. Public; also the benchmark's default. |
+| `DEFAULT_MODEL_ID` / `build_agent(model_id=...)` | `agent.py` | `gemma4:12b` | Ollama model tag. Must be pulled first (`ollama pull <tag>`). Public; also the benchmark's default. |
+| `_SYSTEM_PROMPT` | `agent.py` | (structured string) | The agent's system prompt: a MUST/MUST NOT constraints block plus a sectioned tool-routing table, drone/CAA framing, and the date-phrase instruction. Edit to change tool routing behaviour. |
+| `build_agent(observer=...)` | `agent.py` | fresh `ToolCallObserver` | Tool-call observability hook attached to the agent (see below). Pass your own to read its `calls` after a run. |
 
 To run a different model:
 
@@ -76,6 +86,28 @@ agent = build_agent(model_id="qwen3:30b-a3b", host="http://localhost:11434")
 
 Conversation memory in `chat` mode is a sliding window managed by the Strands
 `Agent`; its size is not configured here.
+
+Every agent has a `ToolCallObserver` (`weather_agent.observability`) attached. It
+times each tool the model calls and logs one tool-call summary plus one
+token/latency line per run at `INFO` — silent under the CLI's default `WARNING`
+level, so raise the level to see the model's routing and cost. Pass a shared
+`observer` to `build_agent` to read its recorded `calls` programmatically (for
+benchmarking or the dashboard).
+
+`weather_agent.benchmark.run_benchmark(queries, *, host, model_id, clock)` runs
+each query through a fresh agent and returns a `BenchmarkReport` (metadata plus
+per-query `RunStat`s; the summary is derived from them). `host` / `model_id`
+default to the same values as `build_agent`; `queries` defaults to
+`_DEFAULT_QUERIES` (a fixed five-query set in `benchmark.py`); `clock` is the
+injectable capture-time seam. `aggregate_runs` / `format_summary`, the report
+serialisation and markdown (`weather_agent.benchmark_report`), and the comparison
+(`weather_agent.benchmark_compare`) are all pure. The `benchmark` CLI subcommand
+writes a JSON report under `_BENCHMARK_DIR`; `benchmark compare` and
+`benchmark markdown` consume saved reports.
+
+Tracing: `weather_agent.tracing.enable_console_tracing()` installs a global
+OpenTelemetry console span exporter. The CLI calls it when `WEATHER_AGENT_TRACE`
+is set (see [Environment variables](#2-environment-variables)).
 
 ---
 
@@ -88,12 +120,12 @@ client.
 | Client | File | `timeout` | Other per-call defaults |
 | --- | --- | --- | --- |
 | `OpenMeteoClient` | `client.py` | `10.0` s | `geocode(count=10)` — number of candidate matches requested. |
-| `AviationClient` | `aviation.py` | `10.0` s | `nearest_metar(search_degrees=1.0)` — half-extent of the search box (~111 km). |
+| `AviationClient` | `aviation.py` | `10.0` s | `nearest_metar(search_degrees=1.0)` and `nearest_taf(search_degrees=1.0)` — half-extent of the search box (~111 km). |
 | `OpenAipClient` | `openaip.py` | `10.0` s | `nearby_airspaces(radius_m=15000)`; `_MAX_RESULTS=50`; key from `api_key=` or `OPENAIP_API_KEY`. |
 
 | Constant | File | Default | Effect |
 | --- | --- | --- | --- |
-| `_DEFAULT_TIMEZONE` | `client.py` | `Europe/London` | Time zone requested for forecast endpoints, so hourly timestamps are UK-local. |
+| `_DEFAULT_TIMEZONE` | `client.py` | `Europe/London` | Fallback time zone for the generic forecast endpoints. The drone path overrides this with the resolved location's own timezone, so its hourly timestamps are location-local. |
 | `_DEFAULT_SEARCH_DEGREES` | `aviation.py` | `1.0` | METAR search box half-extent in degrees. |
 | `_DEFAULT_RADIUS_M` | `openaip.py` | `15000` | Airspace search radius in metres. |
 | `_MAX_RESULTS` | `openaip.py` | `50` | Max airspace volumes requested. |
@@ -117,6 +149,7 @@ All key-free except OpenAIP. Change only if proxying or self-hosting.
 | `_PLANETARY_KP_URL` | `https://services.swpc.noaa.gov/products/noaa-planetary-k-index.json` |
 | `_PLANETARY_KP_FORECAST_URL` | `https://services.swpc.noaa.gov/products/noaa-planetary-k-index-forecast.json` |
 | `_METAR_URL` | `https://aviationweather.gov/api/data/metar` |
+| `_TAF_URL` | `https://aviationweather.gov/api/data/taf` |
 | `_AIRSPACES_URL` | `https://api.core.openaip.net/api/airspaces` |
 
 ---
@@ -157,7 +190,8 @@ natural day phrase (see [section 7](#7-date-phrases-weather_agentdates)).
 | `get_uv_index` | `location` | WHO bands. |
 | `get_solar_potential` | `location`, `days=3` | `days` 1–16. |
 | `get_sun_times` | `location`, `days=1` | `days` 1–16. |
-| `get_aviation_weather` | `location` | Nearest METAR. |
+| `get_aviation_weather` | `location` | Nearest METAR (observed). |
+| `get_nearest_taf` | `location` | Nearest airfield's TAF (aviation forecast), an independent cross-check. |
 | `get_airspace` | `location` | Needs `OPENAIP_API_KEY`. |
 | `get_elevation` | `location` | |
 | `assess_drone_conditions` | `location`, `drone` | One drone; see [drone names](#11-drone-profiles-weather_agentdrone). |
@@ -173,7 +207,7 @@ functions and clients (useful for tests or embedding):
 | --- | --- | --- | --- |
 | `client` | every `*_summary` / domain function | `None` | Inject an `OpenMeteoClient` (or mock); created and closed per call when omitted. |
 | `today` | `weather_for_date`, `historical_summary`, `climate_summary`, `compare_periods` | current UTC date | Reference date for resolving relative phrases (deterministic tests). |
-| `now` | `drone_flight_summary`, `fleet_flight_summary` | current UK-local time | Hours before this are dropped from the outlook. |
+| `now` | `drone_flight_summary`, `fleet_flight_summary` | current time in the location's timezone | Hours before this are dropped from the outlook. |
 | `site_clients` | `drone_flight_summary`, `fleet_flight_summary` | `None` | Inject `AviationClient` / `OpenAipClient` for the METAR and airspace lookups. |
 | `count` | `OpenMeteoClient.geocode` | `10` | Candidate matches requested for disambiguation. |
 
@@ -266,6 +300,37 @@ Wind verdict (per drone, after the FPV factor): governing wind `>` caution limit
 NO-FLY; `>` ideal limit → MARGINAL; else GOOD. The governing wind is the worst wind
 across 0–500 m AGL.
 
+### Data-confidence axis (separate from the verdict)
+
+Each hour also carries a `DataConfidence` (`models.py`: `ADEQUATE` / `DEGRADED` /
+`INSUFFICIENT`), independent of the verdict — *how sure*, not *how flyable*.
+
+- **Missing safety-critical data** (wind, temperature, precipitation, visibility,
+  daylight) caps the hour at `MARGINAL` with a "… data unavailable" reason and marks
+  it `INSUFFICIENT`, so incomplete data never reads as `GOOD`. The secondary caution
+  gates (icing, storm, low cloud, geomagnetic) fail open — their inputs are
+  frequently absent and are proxies, so degrading them would make almost every hour
+  marginal without adding safety.
+- **Forecast uncertainty** marks an otherwise-adequate hour `DEGRADED` when the
+  drone's gust limit lies within one ensemble gust-spread of the governing wind
+  (`downgrade_for_uncertainty`). The verdict is unchanged.
+
+| Constant | File | Default | Effect |
+| --- | --- | --- | --- |
+| `_MIN_ENSEMBLE_MEMBERS` | `flyability.py` | `2` | Minimum member count for a spread to be computed for an hour. |
+| `_ENSEMBLE_WIND_VARIABLE` | `weather.py` | `wind_gusts_10m` | Ensemble variable whose member spread feeds the uncertainty downgrade. |
+| `_DEFAULT_ENSEMBLE_MODEL` | `weather.py` | `icon_seamless` | Ensemble model used for both the temperature-spread tool and the drone uncertainty signal. |
+
+### Night-flight policy (`weather_agent.policy`)
+
+Night handling is dated, jurisdiction-scoped operational policy, not a hardcoded
+verdict, because the rules change. The daylight gate consults a `NightPolicy`
+(`jurisdiction`, `effective_date`, `verdict`, `note`, `source`).
+
+| Constant | File | Default | Effect |
+| --- | --- | --- | --- |
+| `UK_OPEN_CATEGORY_NIGHT` / `DEFAULT_NIGHT_POLICY` | `policy.py` | UK Open Category, effective 2026-01-01, verdict `MARGINAL` | A night-time hour is `MARGINAL` (permitted with a green flashing light and maintained VLOS), not a blanket NO-FLY. Pass `assess_hour(..., night_policy=...)` to override (e.g. a stricter NO-FLY policy). |
+
 ---
 
 ## 11. Drone profiles (`weather_agent.drone`)
@@ -326,7 +391,7 @@ Keyword retrieval over the curated drone tips file.
 
 ## 14. Evaluation harnesses
 
-Two independent ways to check explanation quality.
+Three independent ways to check answer quality.
 
 ### Deterministic guardrail (`weather_agent.evaluation`) — always on
 
@@ -335,6 +400,16 @@ Two independent ways to check explanation quality.
 - `audit_drone_report(assessment, report)` runs that across an assessment; the drone
   report prepends a safety banner if it fires (`_SAFETY_BANNER` in `weather.py`).
   No configuration; runs as part of normal report generation and the test suite.
+
+### Scenario regression suite (`weather_agent.scenarios`) — CI gate
+
+A deterministic safety/faithfulness regression suite. `Scenario` names the terms an
+answer for a representative query must contain and the unsafe claims it must never
+make; `check_output` evaluates a rendered answer and `summarize` produces a
+scorecard. The versioned manifest and its mocked fixtures live in
+`tests/test_scenarios.py`, which runs each scenario through the real engine and
+**fails CI** on any breach (for example a no-fly answer softened into a "go"). Live
+route- and argument-accuracy need a model run and are out of scope here.
 
 ### Opt-in LLM-as-judge (`weather_agent.eval_llm`) — offline only
 

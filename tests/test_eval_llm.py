@@ -64,6 +64,20 @@ def test_parse_judge_response_rejects_malformed(payload: object) -> None:
         _ = _parse_judge_response(payload)
 
 
+@pytest.mark.parametrize("faithful", ["false", "true", 0, 1, None])
+def test_parse_judge_response_rejects_non_boolean_verdict(faithful: object) -> None:
+    """A non-boolean 'faithful' (e.g. the string "false") is rejected, not coerced.
+
+    ``bool("false")`` is truthy, so the old parser would have silently passed an
+    unfaithful verdict; the strict parse now raises instead.
+    """
+    content = json.dumps({"faithful": faithful, "understates_risk": True, "notes": "x"})
+    payload = {"message": {"content": content}}
+
+    with pytest.raises(JudgeError):
+        _ = _parse_judge_response(payload)
+
+
 @pytest.mark.skipif(
     os.environ.get("WEATHER_AGENT_LLM_EVAL") != "1",
     reason="opt-in LLM eval: set WEATHER_AGENT_LLM_EVAL=1 and run an Ollama server",

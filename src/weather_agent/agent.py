@@ -3,6 +3,7 @@
 from strands import Agent
 from strands.models.ollama import OllamaModel
 
+from weather_agent.observability import ToolCallObserver
 from weather_agent.tools import (
     assess_drone_conditions,
     assess_fleet_conditions,
@@ -18,6 +19,7 @@ from weather_agent.tools import (
     get_forecast,
     get_historical_weather,
     get_marine_forecast,
+    get_nearest_taf,
     get_pollen,
     get_river_discharge,
     get_solar_potential,
@@ -72,6 +74,7 @@ _SYSTEM_PROMPT = (
     "- get_solar_potential: solar energy outlook.\n"
     "- get_sun_times: sunrise, sunset, and daylight length.\n"
     "- get_aviation_weather: the nearest airport's observed METAR.\n"
+    "- get_nearest_taf: the nearest airfield's aviation forecast (TAF).\n"
     "- get_airspace: nearby controlled/restricted airspace (decision support "
     "only, not authoritative).\n"
     "- get_elevation: terrain height.\n"
@@ -81,8 +84,9 @@ _SYSTEM_PROMPT = (
     "- assess_fleet_conditions: all the user's drones / the whole fleet.\n"
     "- list_supported_drones: which drone models are covered.\n"
 )
-_DEFAULT_OLLAMA_HOST = "http://localhost:11434"
-_DEFAULT_MODEL_ID = "gemma4:12b"
+# Public so callers (e.g. the benchmark) can target the same defaults as the agent.
+DEFAULT_OLLAMA_HOST = "http://localhost:11434"
+DEFAULT_MODEL_ID = "gemma4:12b"
 
 # Single source of truth for the wired tools: ``build_agent`` registers exactly
 # these, and the prompt-coverage test iterates over the same tuple.
@@ -103,6 +107,7 @@ _TOOLS = (
     get_solar_potential,
     get_sun_times,
     get_aviation_weather,
+    get_nearest_taf,
     get_airspace,
     get_elevation,
     get_weather_at_coordinates,
@@ -113,8 +118,9 @@ _TOOLS = (
 
 
 def build_agent(
-    host: str = _DEFAULT_OLLAMA_HOST,
-    model_id: str = _DEFAULT_MODEL_ID,
+    host: str = DEFAULT_OLLAMA_HOST,
+    model_id: str = DEFAULT_MODEL_ID,
+    observer: ToolCallObserver | None = None,
 ) -> Agent:
     """Build a Strands agent wired with the open-meteo weather tool.
 
@@ -122,16 +128,25 @@ def build_agent(
     ``ollama pull <model_id>`` and ensure ``ollama serve`` is reachable at
     ``host``. The open-meteo tool itself needs no credentials.
 
+    A :class:`ToolCallObserver` is always attached so the model's tool routing
+    and latency are observable (it logs a per-run summary at INFO level). Pass
+    your own ``observer`` to read its recorded ``calls`` after a run, for example
+    for benchmarking or a dashboard.
+
     Args:
         host: Base URL of the Ollama server.
         model_id: Ollama model tag to use, for example ``"gemma4:12b"``.
+        observer: Tool-call observer to attach. Defaults to a fresh, log-only
+            instance whose records are not externally accessible.
 
     Returns:
         A configured agent ready to answer current-weather questions.
     """
+    resolved_observer = observer if observer is not None else ToolCallObserver()
     model = OllamaModel(host=host, model_id=model_id)
     return Agent(
         model=model,
         system_prompt=_SYSTEM_PROMPT,
         tools=list(_TOOLS),
+        hooks=[resolved_observer],
     )

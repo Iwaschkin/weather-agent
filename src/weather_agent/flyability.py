@@ -6,6 +6,14 @@ ratio, band, and a human reason). The worst gate decides the hour's overall
 verdict, and the limiting gates' reasons become the limiting factors. All
 functions are pure and unit-testable without network access. Thresholds are
 deliberately conservative and named for tuning.
+
+Missing-data policy: the safety-critical gates (wind, temperature, precipitation,
+visibility, daylight) treat absent inputs as ``MARGINAL`` with a "data
+unavailable" reason, never ``GOOD`` - incomplete data must not read as a
+clear-to-fly window. The secondary caution gates (icing, storm, low cloud,
+geomagnetic) fail open, because their inputs are frequently absent and are
+proxies rather than hard limits, so degrading them would make almost every hour
+marginal without adding safety.
 """
 
 from __future__ import annotations
@@ -15,6 +23,7 @@ from datetime import datetime
 from typing import TYPE_CHECKING
 
 from weather_agent.models import (
+    DataConfidence,
     DayOutlook,
     DroneAssessment,
     FlightWindow,
@@ -22,11 +31,13 @@ from weather_agent.models import (
     HourAssessment,
     Verdict,
 )
+from weather_agent.policy import DEFAULT_NIGHT_POLICY
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
 
-    from weather_agent.models import DroneFlightHour, DroneForecast, DroneProfile
+    from weather_agent.models import DroneFlightHour, DroneForecast, DroneProfile, TimeSeries
+    from weather_agent.policy import NightPolicy
 
 _KMH_PER_MS = 3.6
 # Precipitation chance: a moderate chance is flyable-with-caution, a high chance
@@ -52,6 +63,8 @@ _NO_OMNI_VISIBILITY_PENALTY_M = 3000.0
 _LOW_LIGHT_VISIBILITY_BONUS_M = 2000.0
 
 _SEVERITY = {Verdict.GOOD: 0, Verdict.MARGINAL: 1, Verdict.NO_FLY: 2}
+# A spread needs at least two members to be meaningful.
+_MIN_ENSEMBLE_MEMBERS = 2
 
 
 def _parse_hour_or_none(time_str: str) -> datetime | None:
@@ -110,7 +123,9 @@ def _effective_gust_limits(profile: DroneProfile) -> tuple[float, float]:
 def _wind_gate(profile: DroneProfile, governing_ms: float | None) -> GateReading:
     ideal, caution = _effective_gust_limits(profile)
     if governing_ms is None:
-        return GateReading("wind_gust", Verdict.MARGINAL, "wind data unavailable", unit="m/s")
+        return GateReading(
+            "wind_gust", Verdict.MARGINAL, "wind data unavailable", unit="m/s", data_missing=True
+        )
     fpv = " (FPV: reduced gust margin)" if profile.is_fpv else ""
     if governing_ms > caution:
         band = Verdict.NO_FLY
@@ -141,6 +156,18 @@ def _precipitation_gate(hour: DroneFlightHour) -> GateReading:
     probability = hour.precipitation_probability_pct
     threshold = _PRECIP_PROBABILITY_NO_FLY_PCT
     if probability is None:
+        # A measured amount of 0 mm is a real "no precipitation" signal, so the
+        # missing probability is benign; only fully absent precipitation data
+        # (no amount either) degrades to marginal rather than reading as good.
+        if hour.precipitation_mm is None:
+            return GateReading(
+                "precip_probability",
+                Verdict.MARGINAL,
+                "precipitation data unavailable",
+                unit="%",
+                threshold=threshold,
+                data_missing=True,
+            )
         return GateReading("precip_probability", Verdict.GOOD, unit="%", threshold=threshold)
     if probability >= _PRECIP_PROBABILITY_NO_FLY_PCT:
         band = Verdict.NO_FLY
@@ -157,7 +184,13 @@ def _precipitation_gate(hour: DroneFlightHour) -> GateReading:
 def _temperature_gate(profile: DroneProfile, hour: DroneFlightHour) -> GateReading:
     temperature = hour.temperature_c
     if temperature is None:
-        return GateReading("temperature", Verdict.GOOD, unit="C")
+        return GateReading(
+            "temperature",
+            Verdict.MARGINAL,
+            "temperature data unavailable",
+            unit="C",
+            data_missing=True,
+        )
     if temperature < profile.min_temp_c or temperature > profile.max_temp_c:
         bound = profile.min_temp_c if temperature < profile.min_temp_c else profile.max_temp_c
         reason = (
@@ -219,14 +252,27 @@ def _visibility_threshold(profile: DroneProfile) -> float:
     return threshold
 
 
-def _daylight_visibility_gate(profile: DroneProfile, hour: DroneFlightHour) -> GateReading:
+def _daylight_visibility_gate(
+    profile: DroneProfile, hour: DroneFlightHour, night_policy: NightPolicy
+) -> GateReading:
     if hour.is_day is False:
+        return GateReading("daylight", night_policy.verdict, night_policy.note)
+    if hour.is_day is None:
         return GateReading(
-            "daylight", Verdict.NO_FLY, "night-time (outside daylight visual line of sight)"
+            "daylight", Verdict.MARGINAL, "daylight data unavailable", data_missing=True
         )
     threshold = _visibility_threshold(profile)
     visibility = hour.visibility_m
-    if visibility is not None and visibility < threshold:
+    if visibility is None:
+        return GateReading(
+            "visibility",
+            Verdict.MARGINAL,
+            "visibility data unavailable",
+            unit="m",
+            threshold=threshold,
+            data_missing=True,
+        )
+    if visibility < threshold:
         reason = (
             f"reduced visibility ({visibility / 1000:.0f} km, "
             f"below the {threshold / 1000:.0f} km threshold)"
@@ -286,6 +332,7 @@ def assess_hour(
     profile: DroneProfile,
     hour: DroneFlightHour,
     kp_index: float | None = None,
+    night_policy: NightPolicy = DEFAULT_NIGHT_POLICY,
 ) -> HourAssessment:
     """Assess a single forecast hour for one drone.
 
@@ -293,6 +340,8 @@ def assess_hour(
         profile: The drone's flight limits.
         hour: The forecast metrics for the hour.
         kp_index: The planetary Kp index for the period, or ``None`` when unknown.
+        night_policy: The dated policy deciding how a night-time hour is treated;
+            defaults to the current UK Open Category rules.
 
     Returns:
         The hour's verdict and the limiting factors that produced it.
@@ -303,7 +352,7 @@ def assess_hour(
         _precipitation_gate(hour),
         _temperature_gate(profile, hour),
         _icing_gate(hour),
-        _daylight_visibility_gate(profile, hour),
+        _daylight_visibility_gate(profile, hour, night_policy),
         _storm_gate(hour),
         _cloud_gate(hour),
         _geomagnetic_gate(kp_index),
@@ -315,12 +364,20 @@ def assess_hour(
         for gate in gates
     )
     factors = tuple(reading.reason for reading in readings if reading.limiting and reading.reason)
+    # Confidence is a separate axis from the verdict: a safety-critical gate that
+    # degraded for *missing* data (not an out-of-limit value) caps the hour.
+    confidence = (
+        DataConfidence.INSUFFICIENT
+        if any(reading.data_missing for reading in readings)
+        else DataConfidence.ADEQUATE
+    )
     return HourAssessment(
         time=hour.time,
         verdict=_worst_verdict(worst),
         limiting_factors=factors,
         governing_wind_ms=governing,
         readings=readings,
+        data_confidence=confidence,
     )
 
 
@@ -405,3 +462,74 @@ def assess_forecast(
         best_window=best_window(hours),
         daily=daily_outlooks(hours),
     )
+
+
+def hourly_gust_spread(series: TimeSeries) -> dict[str, float]:
+    """Per-timestamp gust spread (max - min across ensemble members), in m/s.
+
+    A measure of forecast uncertainty: a wide spread of member gusts means the
+    members disagree about the wind for that hour. Timestamps with fewer than two
+    present member values are omitted (no spread to measure).
+
+    Args:
+        series: An ensemble time series whose columns are per-member gust values
+            (in km/h, as open-meteo returns them).
+
+    Returns:
+        A mapping of timestamp to gust spread in m/s.
+    """
+    spreads: dict[str, float] = {}
+    for index, timestamp in enumerate(series.timestamps):
+        members = [
+            value
+            for column in series.series.values()
+            if index < len(column) and (value := column[index]) is not None
+        ]
+        if len(members) >= _MIN_ENSEMBLE_MEMBERS:
+            spreads[timestamp] = (max(members) - min(members)) / _KMH_PER_MS
+    return spreads
+
+
+def _wind_threshold(hour: HourAssessment) -> float | None:
+    """Return the wind gate's gust threshold for an hour, or None if absent."""
+    for reading in hour.readings:
+        if reading.metric == "wind_gust":
+            return reading.threshold
+    return None
+
+
+def _apply_spread(hour: HourAssessment, spread: float | None) -> HourAssessment:
+    if spread is None or spread <= 0 or hour.data_confidence is not DataConfidence.ADEQUATE:
+        return hour
+    wind = hour.governing_wind_ms
+    threshold = _wind_threshold(hour)
+    if wind is None or threshold is None:
+        return hour
+    if abs(threshold - wind) <= spread:
+        return replace(hour, data_confidence=DataConfidence.DEGRADED)
+    return hour
+
+
+def downgrade_for_uncertainty(
+    assessment: DroneAssessment,
+    spread_by_time: Mapping[str, float],
+) -> DroneAssessment:
+    """Lower confidence to ``DEGRADED`` where the gust limit is within ensemble spread.
+
+    Turns a point forecast into a decision under uncertainty: when an otherwise
+    data-adequate hour has its governing wind within one ensemble gust-spread of the
+    drone's gust limit, the members plausibly cross the limit, so the hour's
+    confidence drops to ``DEGRADED``. The verdict is unchanged, and hours already
+    ``INSUFFICIENT`` (missing data) are left as-is. The surface-gust spread is used
+    as a proxy for the uncertainty band around the governing 0-500 m wind.
+
+    Args:
+        assessment: The per-hour assessment to annotate.
+        spread_by_time: Per-hour gust spread (m/s) keyed by the hour's timestamp.
+
+    Returns:
+        The assessment with confidence downgraded on the uncertain hours. The
+        verdicts, best window, and daily outlook are unchanged.
+    """
+    hours = tuple(_apply_spread(hour, spread_by_time.get(hour.time)) for hour in assessment.hours)
+    return replace(assessment, hours=hours)

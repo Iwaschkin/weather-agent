@@ -20,6 +20,7 @@ from weather_agent.models import (
     KpForecastEntry,
     KpIndex,
     MetarReport,
+    TafReport,
     TimeSeries,
     UvIndex,
 )
@@ -148,6 +149,7 @@ def _parse_geocode_entry(entry: object) -> GeocodeResult:
         population=_optional_int(mapping, "population"),
         latitude=_require_float(mapping, "latitude"),
         longitude=_require_float(mapping, "longitude"),
+        timezone=_optional_str(mapping, "timezone"),
     )
 
 
@@ -687,6 +689,51 @@ def parse_metars(payload: object) -> tuple[MetarReport, ...]:
     for entry in cast("list[object]", payload):
         if isinstance(entry, dict):
             report = _metar_from(cast("dict[str, object]", entry))
+            if report is not None:
+                reports.append(report)
+    return tuple(reports)
+
+
+def _taf_from(mapping: dict[str, object]) -> TafReport | None:
+    station = mapping.get("icaoId")
+    latitude = _lenient_float(mapping.get("lat"))
+    longitude = _lenient_float(mapping.get("lon"))
+    if not isinstance(station, str) or latitude is None or longitude is None:
+        return None
+    issued = mapping.get("issueTime")
+    raw = mapping.get("rawTAF")
+    return TafReport(
+        station=station,
+        latitude=latitude,
+        longitude=longitude,
+        issued=issued if isinstance(issued, str) else "",
+        raw=raw if isinstance(raw, str) else "",
+    )
+
+
+def parse_tafs(payload: object) -> tuple[TafReport, ...]:
+    """Parse an aviationweather.gov TAF (JSON) payload into typed forecasts.
+
+    Lenient like :func:`parse_metars`: the API returns a JSON array of station
+    forecasts; entries missing an id or coordinates are skipped rather than failing
+    the whole batch.
+
+    Args:
+        payload: Decoded JSON from the TAF endpoint (``format=json``).
+
+    Returns:
+        The parsed forecasts (possibly empty).
+
+    Raises:
+        AviationError: If the payload is not a JSON array.
+    """
+    if not isinstance(payload, list):
+        not_list_message = "taf response"
+        raise AviationError(not_list_message)
+    reports: list[TafReport] = []
+    for entry in cast("list[object]", payload):
+        if isinstance(entry, dict):
+            report = _taf_from(cast("dict[str, object]", entry))
             if report is not None:
                 reports.append(report)
     return tuple(reports)

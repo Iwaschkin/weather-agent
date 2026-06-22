@@ -12,9 +12,9 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, tzinfo
 from typing import TYPE_CHECKING
-from zoneinfo import ZoneInfo
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import httpx
 
@@ -30,7 +30,11 @@ from weather_agent.drone_report import (
     reconcile_metar,
 )
 from weather_agent.evaluation import SAFETY_BANNER, audit_drone_report
-from weather_agent.flyability import assess_forecast
+from weather_agent.flyability import (
+    assess_forecast,
+    downgrade_for_uncertainty,
+    hourly_gust_spread,
+)
 from weather_agent.geocoding import parse_location, select_best_match
 from weather_agent.knowledge import load_sections, retrieve
 from weather_agent.models import (
@@ -59,6 +63,7 @@ from weather_agent.reporting import (
     describe_period,
     describe_solar,
     describe_sun_times,
+    describe_taf,
     describe_uv,
 )
 from weather_agent.results import Answer, Failed, Invalid, LookupOutcome, NotFound
@@ -78,6 +83,7 @@ if TYPE_CHECKING:
         GeocodeResult,
         KpForecastEntry,
         MetarReport,
+        TimeSeries,
     )
 
 _DEFAULT_CLIMATE_MODEL = "EC_Earth3P_HR"
@@ -99,6 +105,9 @@ _POLLEN_VARIABLES = (
 _POLLEN_REQUEST = ",".join(_POLLEN_VARIABLES)
 _SOLAR_FORECAST_DAYS = 3
 _ENSEMBLE_VARIABLE = "temperature_2m"
+# Surface gusts across ensemble members give the wind forecast's spread, used as the
+# uncertainty band for the drone wind decision (see downgrade_for_uncertainty).
+_ENSEMBLE_WIND_VARIABLE = "wind_gusts_10m"
 _HTTP_BAD_REQUEST = 400
 _ROUTED_CLIMATE_CAVEAT = (
     "(This date is beyond the ~16-day forecast horizon, so the figures above are a "
@@ -603,6 +612,43 @@ def aviation_summary(
             aviation.close()
 
 
+def taf_summary(
+    location: str,
+    client: OpenMeteoClient | None = None,
+    aviation_client: AviationClient | None = None,
+) -> LookupOutcome:
+    """Build a nearest-airfield aviation-forecast (TAF) summary for a location.
+
+    The forecast counterpart to :func:`aviation_summary`'s observation: an
+    independent forecast for the nearest reporting airfield, a cross-check against
+    the model's gridded forecast.
+
+    Args:
+        location: A city or place name.
+        client: Optional open-meteo client (used for geocoding).
+        aviation_client: Optional aviation client; created and closed here when not
+            provided.
+
+    Returns:
+        An outcome wrapping the nearest station's TAF, or a note when no station
+        reports nearby.
+    """
+    owns_aviation = aviation_client is None
+    aviation = aviation_client if aviation_client is not None else AviationClient()
+    try:
+
+        def describe(_active: OpenMeteoClient, place: GeocodeResult) -> str:
+            report = aviation.nearest_taf(place.latitude, place.longitude)
+            if report is None:
+                return f"No aviation forecast (TAF) station was found near {_place_label(place)}."
+            return describe_taf(_place_label(place), report)
+
+        return _summarize(location, client, describe)
+    finally:
+        if owns_aviation:
+            aviation.close()
+
+
 _NO_KEY_NOTE = "unavailable (no OPENAIP_API_KEY configured)"
 
 
@@ -858,7 +904,6 @@ def rank_locations(
 
 _DRONE_FORECAST_DAYS = 5
 _MAX_DRONE_FORECAST_DAYS = 7
-_UK_TIMEZONE = ZoneInfo("Europe/London")
 
 
 @dataclass(frozen=True, slots=True)
@@ -1009,11 +1054,13 @@ def _kp_at(buckets: list[tuple[datetime, float]], when_utc: datetime) -> float |
 def _resolve_kp_by_hour(
     hours: tuple[DroneFlightHour, ...],
     entries: tuple[KpForecastEntry, ...],
+    zone: tzinfo,
 ) -> dict[str, float] | None:
     """Map each forecast hour's timestamp to the Kp predicted for that hour.
 
-    The Kp forecast is in 3-hour UTC buckets; forecast hours are UK-local naive
-    timestamps, so each is localised and converted to UTC before bucket lookup.
+    The Kp forecast is in 3-hour UTC buckets; forecast hours are local naive
+    timestamps in ``zone``, so each is localised and converted to UTC before
+    bucket lookup.
     """
     buckets = _kp_buckets(entries)
     if not buckets:
@@ -1021,7 +1068,7 @@ def _resolve_kp_by_hour(
     mapping: dict[str, float] = {}
     for hour in hours:
         try:
-            local = datetime.fromisoformat(hour.time).replace(tzinfo=_UK_TIMEZONE)
+            local = datetime.fromisoformat(hour.time).replace(tzinfo=zone)
         except ValueError:
             continue
         kp = _kp_at(buckets, local.astimezone(UTC))
@@ -1033,13 +1080,62 @@ def _resolve_kp_by_hour(
 def _drone_kp_by_hour(
     client: OpenMeteoClient,
     hours: tuple[DroneFlightHour, ...],
+    zone: tzinfo,
 ) -> dict[str, float] | None:
     """Resolve per-hour Kp from the forecast, falling back to the current value."""
-    forecast = _resolve_kp_by_hour(hours, _best_effort_kp_forecast(client))
+    forecast = _resolve_kp_by_hour(hours, _best_effort_kp_forecast(client), zone)
     if forecast is not None:
         return forecast
     current = _best_effort_kp(client)
     return {hour.time: current for hour in hours} if current is not None else None
+
+
+def _resolve_spread_by_hour(
+    hours: tuple[DroneFlightHour, ...],
+    series: TimeSeries,
+    zone: tzinfo,
+) -> dict[str, float]:
+    """Map each forecast hour to its ensemble gust spread (m/s).
+
+    The ensemble is requested in UTC, while forecast hours are local naive
+    timestamps in ``zone``, so each hour is converted to UTC to find its matching
+    ensemble row.
+    """
+    spread_at_utc = hourly_gust_spread(series)
+    if not spread_at_utc:
+        return {}
+    mapping: dict[str, float] = {}
+    for hour in hours:
+        when = _hour_to_utc(hour.time, zone)
+        if when is None:
+            continue
+        spread = spread_at_utc.get(when.strftime("%Y-%m-%dT%H:%M"))
+        if spread is not None:
+            mapping[hour.time] = spread
+    return mapping
+
+
+def _drone_spread_by_hour(
+    client: OpenMeteoClient,
+    hours: tuple[DroneFlightHour, ...],
+    latitude: float,
+    longitude: float,
+    zone: tzinfo,
+) -> dict[str, float]:
+    """Resolve per-hour ensemble gust spread, returning {} on any failure.
+
+    Forecast uncertainty is a useful but non-essential signal, so an ensemble
+    outage must not break the assessment.
+    """
+    try:
+        series = client.ensemble_series(
+            latitude, longitude, _ENSEMBLE_WIND_VARIABLE, _DEFAULT_ENSEMBLE_MODEL
+        )
+    except httpx.HTTPError:
+        return {}
+    except OpenMeteoError:
+        return {}
+    return _resolve_spread_by_hour(hours, series, zone)
 
 
 def _site_briefing(
@@ -1058,10 +1154,25 @@ def _site_briefing(
     )
 
 
-def _hour_to_utc(time: str) -> datetime | None:
-    """Read a UK-local naive forecast timestamp as an aware UTC datetime."""
+def _location_zone(place: GeocodeResult) -> tzinfo:
+    """The place's timezone, falling back to UTC when the geocoder omits it.
+
+    Drone forecast hours are requested and labelled in this zone (CAA guidance stays
+    UK-scoped regardless), and the same zone converts those local timestamps back to
+    UTC for Kp, ensemble, and METAR alignment.
+    """
+    if not place.timezone:
+        return UTC
     try:
-        return datetime.fromisoformat(time).replace(tzinfo=_UK_TIMEZONE).astimezone(UTC)
+        return ZoneInfo(place.timezone)
+    except ZoneInfoNotFoundError:
+        return UTC
+
+
+def _hour_to_utc(time: str, zone: tzinfo) -> datetime | None:
+    """Read a local naive forecast timestamp (in ``zone``) as an aware UTC datetime."""
+    try:
+        return datetime.fromisoformat(time).replace(tzinfo=zone).astimezone(UTC)
     except ValueError:
         return None
 
@@ -1069,6 +1180,7 @@ def _hour_to_utc(time: str) -> datetime | None:
 def _nearest_forecast_hour(
     hours: tuple[DroneFlightHour, ...],
     observed: str,
+    zone: tzinfo,
 ) -> DroneFlightHour | None:
     """Pick the forecast hour closest in time to a METAR observation (both in UTC)."""
     try:
@@ -1078,7 +1190,7 @@ def _nearest_forecast_hour(
     nearest: DroneFlightHour | None = None
     smallest_gap: float | None = None
     for hour in hours:
-        when = _hour_to_utc(hour.time)
+        when = _hour_to_utc(hour.time, zone)
         if when is None:
             continue
         gap = abs((when - target).total_seconds())
@@ -1087,11 +1199,13 @@ def _nearest_forecast_hour(
     return nearest
 
 
-def _with_metar_comparison(briefing: SiteBriefing, forecast: DroneForecast) -> SiteBriefing:
+def _with_metar_comparison(
+    briefing: SiteBriefing, forecast: DroneForecast, zone: tzinfo
+) -> SiteBriefing:
     """Attach an observed-vs-forecast note to the briefing when both are available."""
     if briefing.metar is None:
         return briefing
-    hour = _nearest_forecast_hour(forecast.hours, briefing.metar.observed)
+    hour = _nearest_forecast_hour(forecast.hours, briefing.metar.observed, zone)
     if hour is None:
         return briefing
     note = reconcile_metar(briefing.metar, hour)
@@ -1125,16 +1239,16 @@ def drone_flight_summary(
     planetary Kp index, drops already-elapsed hours, runs the flyability rules,
     adds UK CAA guidance, and retrieves matching qualitative tips.
 
-    UK-scoped: the forecast is requested in UK local time and the CAA guidance
-    follows UK open-category rules, so hour labels for non-UK locations appear in
-    UK time rather than the location's local time.
+    Forecast hours are requested and labelled in the location's own timezone; the
+    CAA guidance still follows UK open-category rules regardless of location.
 
     Args:
         location: A city or place name.
         drone: A supported drone name, for example ``"Mini 5 Pro"``.
         client: Optional client to use.
-        now: Current naive UK-local time; defaults to the actual current time.
-            Hours before this are excluded so the outlook starts from now.
+        now: Current naive local time in the location's timezone; defaults to the
+            actual current time. Hours before this are excluded so the outlook
+            starts from now.
         site_clients: Optional injected aviation/airspace clients (tests pass
             mocks); created internally and closed afterwards when omitted.
 
@@ -1145,18 +1259,25 @@ def drone_flight_summary(
     profile = find_profile(drone)
     if profile is None:
         return Answer(describe_supported_drones(DRONE_PROFILES))
-    reference = now if now is not None else datetime.now(_UK_TIMEZONE).replace(tzinfo=None)
 
     with _open_site_clients(site_clients) as (aviation, openaip):
 
         def describe(active: OpenMeteoClient, place: GeocodeResult) -> str:
-            forecast = active.drone_forecast(place.latitude, place.longitude, _DRONE_FORECAST_DAYS)
-            kp_by_time = _drone_kp_by_hour(active, forecast.hours)
-            briefing = _with_metar_comparison(
-                _site_briefing(active, aviation, openaip, place), forecast
+            zone = _location_zone(place)
+            reference = now if now is not None else datetime.now(zone).replace(tzinfo=None)
+            forecast = active.drone_forecast(
+                place.latitude, place.longitude, _DRONE_FORECAST_DAYS, place.timezone or "UTC"
             )
-            assessment = assess_forecast(
-                profile, forecast, _place_label(place), kp_by_time, reference
+            kp_by_time = _drone_kp_by_hour(active, forecast.hours, zone)
+            spread = _drone_spread_by_hour(
+                active, forecast.hours, place.latitude, place.longitude, zone
+            )
+            briefing = _with_metar_comparison(
+                _site_briefing(active, aviation, openaip, place), forecast, zone
+            )
+            assessment = downgrade_for_uncertainty(
+                assess_forecast(profile, forecast, _place_label(place), kp_by_time, reference),
+                spread,
             )
             return _drone_report(assessment, profile, briefing)
 
@@ -1186,19 +1307,26 @@ def _fleet_members(
     active: OpenMeteoClient,
     place: GeocodeResult,
     site: tuple[AviationClient, OpenAipClient],
-    reference: datetime,
+    now: datetime | None,
     days: int = _DRONE_FORECAST_DAYS,
 ) -> tuple[tuple[FleetMember, ...], str, SiteBriefing]:
     """Assess every supported drone against one shared forecast, Kp, and briefing."""
     aviation, openaip = site
-    forecast = active.drone_forecast(place.latitude, place.longitude, days)
-    kp_by_time = _drone_kp_by_hour(active, forecast.hours)
-    briefing = _with_metar_comparison(_site_briefing(active, aviation, openaip, place), forecast)
+    zone = _location_zone(place)
+    reference = now if now is not None else datetime.now(zone).replace(tzinfo=None)
+    forecast = active.drone_forecast(place.latitude, place.longitude, days, place.timezone or "UTC")
+    kp_by_time = _drone_kp_by_hour(active, forecast.hours, zone)
+    spread = _drone_spread_by_hour(active, forecast.hours, place.latitude, place.longitude, zone)
+    briefing = _with_metar_comparison(
+        _site_briefing(active, aviation, openaip, place), forecast, zone
+    )
     label = _place_label(place)
     members = tuple(
         FleetMember(
             profile=profile,
-            assessment=assess_forecast(profile, forecast, label, kp_by_time, reference),
+            assessment=downgrade_for_uncertainty(
+                assess_forecast(profile, forecast, label, kp_by_time, reference), spread
+            ),
             guidance=caa_guidance(profile),
         )
         for profile in DRONE_PROFILES
@@ -1220,14 +1348,15 @@ def fleet_flight_summary(
     per-drone tool repeatedly (which small models do unreliably), and the forecast
     is fetched once rather than per drone.
 
-    UK-scoped like :func:`drone_flight_summary`: forecast hours are UK-local and
-    the CAA guidance follows UK open-category rules.
+    Forecast hours are in the location's timezone like :func:`drone_flight_summary`;
+    the CAA guidance still follows UK open-category rules.
 
     Args:
         location: A city or place name.
         client: Optional client to use.
-        now: Current naive UK-local time; defaults to the actual current time.
-            Hours before this are excluded so the outlook starts from now.
+        now: Current naive local time in the location's timezone; defaults to the
+            actual current time. Hours before this are excluded so the outlook
+            starts from now.
         site_clients: Optional injected aviation/airspace clients (tests pass
             mocks); created internally and closed afterwards when omitted.
 
@@ -1262,7 +1391,8 @@ def assess_fleet(
         location: A city or place name.
         days: Forecast horizon in days (1 to 7).
         client: Optional client to use.
-        now: Current naive UK-local time; hours before it are excluded.
+        now: Current naive local time in the location's timezone; hours before it
+            are excluded.
         site_clients: Optional injected aviation/airspace clients.
 
     Returns:
@@ -1277,7 +1407,6 @@ def assess_fleet(
     if not 1 <= days <= _MAX_DRONE_FORECAST_DAYS:
         message = f"days must be between 1 and {_MAX_DRONE_FORECAST_DAYS} (got {days})."
         raise ValueError(message)
-    reference = now if now is not None else datetime.now(_UK_TIMEZONE).replace(tzinfo=None)
     owns_client = client is None
     active = client if client is not None else OpenMeteoClient()
     try:
@@ -1285,7 +1414,7 @@ def assess_fleet(
         if place is None:
             return None
         with _open_site_clients(site_clients) as site:
-            members, label, briefing = _fleet_members(active, place, site, reference, days)
+            members, label, briefing = _fleet_members(active, place, site, now, days)
         return FleetAssessment(place_label=label, members=members, briefing=briefing)
     finally:
         if owns_client:

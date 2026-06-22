@@ -35,6 +35,7 @@ labelled bands, and a faithfulness guardrail stops the model under-stating the r
 | `get_solar_potential` | Forecast | Daily solar radiation, sunshine, and daylight |
 | `get_sun_times` | Forecast | Sunrise, sunset, and daylight length |
 | `get_aviation_weather` | aviationweather.gov | Nearest airport's observed METAR (wind, visibility, ceiling) |
+| `get_nearest_taf` | aviationweather.gov | Nearest airfield's aviation forecast (TAF), an independent cross-check |
 | `get_airspace` | OpenAIP (key) | Nearby controlled/restricted airspace (decision support) |
 | `get_elevation` | Elevation | Terrain height |
 | `assess_drone_conditions` | Forecast + NOAA Kp + METAR + OpenAIP | Per-hour flyability for one drone (DJI Neo, Avata 2, Mini 5 Pro) with UK CAA notes |
@@ -75,6 +76,16 @@ airport's observed METAR (a reality check on the model, reconciled against the
 forecast for like-for-like surface gust and visibility), and nearby airspace from
 OpenAIP, plus matching tips.
 
+Beyond the verdict, each hour carries a separate **data-confidence** axis. Missing
+safety-critical inputs (wind, temperature, precipitation, visibility, daylight) cap
+the hour at `MARGINAL` and mark it `INSUFFICIENT` rather than letting incomplete
+data read as `GOOD`; a wide ensemble gust spread near a drone's limit marks the hour
+`DEGRADED` (the forecast could plausibly cross the limit). Night flying is a dated,
+configurable policy — UK Open-Category rules from 2026 permit it with a green
+flashing light and maintained visual line of sight, so a night hour is `MARGINAL`,
+not a blanket no-fly. Forecast hours are labelled in the location's own timezone,
+while the CAA guidance stays UK-scoped.
+
 `assess_fleet_conditions` runs the same assessment for every supported drone in a
 single call, fetching the forecast once and showing the drones side by side, so
 "how do all my drones look?" does not depend on the model calling the per-drone tool
@@ -99,17 +110,24 @@ Assist / Altitude Angel before flying. The airspace lookup needs an OpenAIP key
 - `weather_agent.routing` — pure date-based selection of the right data source.
 - `weather_agent.dates` — pure resolution of natural day phrases ("tomorrow", "next friday") to dates.
 - `weather_agent.drone` — drone model profiles (DJI Neo, Avata 2, Mini 5 Pro) and lookup.
-- `weather_agent.flyability` — pure rules engine turning forecast hours into flight verdicts.
+- `weather_agent.flyability` — pure rules engine turning forecast hours into flight verdicts and a data-confidence axis (incl. ensemble-uncertainty downgrade).
+- `weather_agent.policy` — dated, jurisdiction-scoped operational policy (the night-flight rules consulted by the engine).
 - `weather_agent.caa` — pure UK CAA open-category guidance and disclaimer.
 - `weather_agent.knowledge` — keyword retrieval over the curated drone knowledge file.
 - `weather_agent.drone_report` — pure formatting of drone flight assessments (single and fleet).
 - `weather_agent.evaluation` — deterministic faithfulness checks and the runtime under-statement guardrail.
+- `weather_agent.scenarios` — pure faithfulness/safety scenario checks behind the CI regression suite.
 - `weather_agent.eval_llm` — opt-in, offline LLM-as-judge faithfulness scoring (needs Ollama).
 - `weather_agent.reporting_llm` — grounded, audited LLM-written drone reports (needs Ollama).
 - `weather_agent.weather` — domain logic turning a place name into a readable summary.
 - `weather_agent.results` — typed lookup outcomes (answer/not-found/invalid/failure), rendered to text at the tool boundary.
 - `weather_agent.tools` — the Strands `@tool` wrappers exposing each capability.
-- `weather_agent.agent` — builds the agent and wires in the tools.
+- `weather_agent.observability` — a Strands hook that times the model's tool calls and logs a per-run tool and token/latency summary.
+- `weather_agent.benchmark` — opt-in cost / tool-routing benchmark over a query set (pure aggregation plus an Ollama-backed runner).
+- `weather_agent.benchmark_report` — serialise, persist, load, and render (markdown) a benchmark report.
+- `weather_agent.benchmark_compare` — compare two benchmark reports metric by metric.
+- `weather_agent.tracing` — opt-in OpenTelemetry console span export.
+- `weather_agent.agent` — builds the agent and wires in the tools and the observability hook.
 - `weather_agent.cli` — command-line entrypoint.
 
 ## Running the agent
@@ -148,6 +166,37 @@ Type `exit` or press Ctrl-C to quit.
 
 The host and model tag can be overridden via `build_agent(host=..., model_id=...)`.
 
+### Observability and benchmarking
+
+Every agent has a `ToolCallObserver` attached, which logs a per-run tool-call
+summary and a token/latency line at `INFO` (silent under the CLI's default
+`WARNING` level — lower the level to see the cheap model's routing and cost).
+
+To measure cost and tool routing across a representative query set:
+
+```shell
+uv run weather-agent benchmark
+```
+
+It runs each query through a fresh agent, prints aggregate tokens, model latency
+(mean / p50 / p95), and a tool-call breakdown, and writes a timestamped JSON
+report under `benchmarks/`. It needs a running Ollama server.
+
+Saved reports can be compared (across models, or before and after a change) or
+rendered as a markdown table:
+
+```shell
+uv run weather-agent benchmark compare benchmarks/<a>.json benchmarks/<b>.json
+uv run weather-agent benchmark markdown benchmarks/<report>.json
+```
+
+For a full execution trace, set `WEATHER_AGENT_TRACE` to any value to print
+OpenTelemetry spans (event-loop cycles, model calls, tool calls) for each run:
+
+```shell
+WEATHER_AGENT_TRACE=1 uv run weather-agent "What is the weather in Tokyo?"
+```
+
 ## Configuration
 
 The weather, climate, air-quality, marine, and pollen tools need no API key. The
@@ -182,7 +231,9 @@ cd web && uv run reflex run     # then open http://localhost:3000
 ```
 
 The charts work without Ollama; the AI briefing needs a running Ollama server
-(`ollama serve`, model pulled). See [`web/README.md`](web/README.md) for details.
+(`ollama serve`, model pulled). A linked **Benchmark** page runs the cost /
+tool-routing benchmark from the browser and shows the result as a table (it runs
+the agent, so it needs Ollama). See [`web/README.md`](web/README.md) for details.
 
 ## Development
 

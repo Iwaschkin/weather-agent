@@ -147,6 +147,25 @@ def _drone_card(drone: DroneView) -> rx.Component:
                 align="center",
             ),
             rx.text(drone.summary, color_scheme="gray", size="2"),
+            rx.cond(
+                drone.incomplete_hours > 0,
+                rx.callout(
+                    "Some hours had incomplete safety data - capped at marginal, not good.",
+                    icon="info",
+                    color_scheme="amber",
+                    size="1",
+                ),
+            ),
+            rx.cond(
+                drone.low_confidence_hours > 0,
+                rx.callout(
+                    "Some hours have the gust limit within the ensemble spread - "
+                    "the forecast could cross it.",
+                    icon="info",
+                    color_scheme="amber",
+                    size="1",
+                ),
+            ),
             _chart(drone),
             _ribbon(drone),
             _report(drone),
@@ -163,7 +182,13 @@ def index() -> rx.Component:
     """The single dashboard page."""
     return rx.container(
         rx.vstack(
-            rx.heading("Drone Flyability Forecast", size="7"),
+            rx.hstack(
+                rx.heading("Drone Flyability Forecast", size="7"),
+                rx.spacer(),
+                rx.link("Benchmark", href="/benchmark"),
+                width="100%",
+                align="center",
+            ),
             rx.text(
                 "Pick a location and horizon for a per-drone outlook and an AI briefing.",
                 color_scheme="gray",

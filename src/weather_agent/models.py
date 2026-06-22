@@ -26,6 +26,8 @@ class GeocodeResult:
             otherwise-equivalent matches so larger places win ties.
         latitude: Latitude in decimal degrees.
         longitude: Longitude in decimal degrees.
+        timezone: IANA timezone name for the place (for example ``"Asia/Tokyo"``),
+            or an empty string when the API omits it.
     """
 
     name: str
@@ -35,6 +37,7 @@ class GeocodeResult:
     population: int | None
     latitude: float
     longitude: float
+    timezone: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -357,6 +360,30 @@ class MetarReport:
 
 
 @dataclass(frozen=True, slots=True)
+class TafReport:
+    """A nearest-airfield TAF (Terminal Aerodrome Forecast).
+
+    The aviation *forecast* counterpart to :class:`MetarReport`'s observation: an
+    independent forecast for the nearest reporting airfield, useful as a cross-check
+    against the model's gridded forecast. Only the header fields are decoded; the
+    full validity window and change groups stay in ``raw`` for the operator to read.
+
+    Attributes:
+        station: ICAO station identifier (for example ``"EGCC"``).
+        latitude: Station latitude in decimal degrees.
+        longitude: Station longitude in decimal degrees.
+        issued: Issue time as reported by the API, or an empty string.
+        raw: The raw TAF text (includes the validity period and change groups).
+    """
+
+    station: str
+    latitude: float
+    longitude: float
+    issued: str
+    raw: str
+
+
+@dataclass(frozen=True, slots=True)
 class Airspace:
     """A nearby airspace volume from OpenAIP (decision support, not authoritative).
 
@@ -390,6 +417,26 @@ class Verdict(Enum):
     NO_FLY = "no_fly"
 
 
+class DataConfidence(Enum):
+    """How complete and certain an hour's safety-critical inputs were.
+
+    A separate axis from :class:`Verdict`: the verdict says *how flyable*, this says
+    *how sure*. They are independent - a ``MARGINAL`` hour may be ``ADEQUATE`` (a
+    real borderline) or ``INSUFFICIENT`` (capped at marginal because data was
+    missing), and a reader should treat those differently.
+
+    Attributes:
+        ADEQUATE: Every safety-critical input was present.
+        DEGRADED: Inputs were present but uncertain (e.g. wide ensemble spread).
+        INSUFFICIENT: A safety-critical input was missing, so the hour could not be
+            certified and was capped at ``MARGINAL`` rather than read as ``GOOD``.
+    """
+
+    ADEQUATE = "adequate"
+    DEGRADED = "degraded"
+    INSUFFICIENT = "insufficient"
+
+
 @dataclass(frozen=True, slots=True)
 class GateReading:
     """One weather gate's structured judgment for an hour.
@@ -408,6 +455,8 @@ class GateReading:
         unit: The value's unit (for example ``"m/s"``, ``"%"``), or empty.
         threshold: The limit the value was judged against, or ``None``.
         limiting: Whether this gate set (tied for) the hour's overall verdict.
+        data_missing: Whether this gate degraded because its safety-critical input
+            was absent (rather than because a present value was out of limits).
         ratio: ``value / threshold`` when both are present and the threshold is
             non-zero, else ``None`` (a computed property, so the model never
             divides itself).
@@ -420,6 +469,7 @@ class GateReading:
     unit: str = ""
     threshold: float | None = None
     limiting: bool = False
+    data_missing: bool = False
 
     @property
     def ratio(self) -> float | None:
@@ -443,6 +493,8 @@ class HourAssessment:
         readings: Every gate's structured judgment for the hour, in evaluation
             order (raw value, threshold, ratio, band), for explanation and edge
             reasoning beyond the flat ``limiting_factors`` strings.
+        data_confidence: How complete the hour's safety-critical inputs were,
+            independent of the verdict.
     """
 
     time: str
@@ -450,6 +502,7 @@ class HourAssessment:
     limiting_factors: tuple[str, ...]
     governing_wind_ms: float | None
     readings: tuple[GateReading, ...] = ()
+    data_confidence: DataConfidence = DataConfidence.ADEQUATE
 
 
 @dataclass(frozen=True, slots=True)

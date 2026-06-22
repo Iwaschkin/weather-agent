@@ -17,6 +17,7 @@ from weather_agent.drone_report import (
 )
 from weather_agent.knowledge import KnowledgeSection
 from weather_agent.models import (
+    DataConfidence,
     DayAlmanac,
     DayOutlook,
     DroneAssessment,
@@ -49,6 +50,7 @@ _GEOCODE_BODY: dict[str, object] = {
             "admin1": "England",
             "latitude": 53.16,
             "longitude": -2.21,
+            "timezone": "Europe/London",
         },
     ],
 }
@@ -71,6 +73,15 @@ _KP_BODY: list[object] = [
     ["time_tag", "Kp"],
     ["2026-06-16 09:00:00", "2"],
 ]
+# Ensemble gusts (UTC) aligned to the 10:00/11:00 BST forecast hours; tight member
+# spread, so it never triggers a forecast-confidence downgrade in the shared tests.
+_ENSEMBLE_BODY: dict[str, object] = {
+    "hourly": {
+        "time": ["2026-06-16T09:00", "2026-06-16T10:00"],
+        "wind_gusts_10m_member01": [10.0, 10.0],
+        "wind_gusts_10m_member02": [11.0, 11.0],
+    },
+}
 _METAR_BODY: list[object] = [
     {
         "icaoId": "EGCC",
@@ -194,6 +205,42 @@ def test_describe_drone_assessment_renders_daylight_and_daily_outlook() -> None:
     assert "2026-06-16: 1 good h, best 10:00-10:00" in text
 
 
+def test_describe_drone_assessment_flags_incomplete_data() -> None:
+    """An hour capped at marginal for missing data adds a data-confidence caveat."""
+    assessment = DroneAssessment(
+        drone_name="DJI Mini 5 Pro",
+        place_label="Congleton, England",
+        hours=(
+            HourAssessment(
+                "10:00",
+                Verdict.MARGINAL,
+                ("visibility data unavailable",),
+                4.0,
+                data_confidence=DataConfidence.INSUFFICIENT,
+            ),
+        ),
+        best_window=None,
+    )
+
+    text = describe_drone_assessment(assessment, caa_guidance(MINI_5_PRO), ())
+
+    assert "Data confidence: 1 hour had incomplete safety data" in text
+
+
+def test_describe_drone_assessment_omits_confidence_caveat_when_complete() -> None:
+    """A fully-adequate assessment carries no data-confidence caveat."""
+    assessment = DroneAssessment(
+        drone_name="DJI Mini 5 Pro",
+        place_label="Congleton, England",
+        hours=(HourAssessment("10:00", Verdict.GOOD, (), 4.0),),
+        best_window=FlightWindow("10:00", "10:00", 1),
+    )
+
+    text = describe_drone_assessment(assessment, caa_guidance(MINI_5_PRO), ())
+
+    assert "Data confidence:" not in text
+
+
 def test_describe_drone_assessment_notes_empty_outlook() -> None:
     """When every hour has elapsed, the outlook says so instead of an empty list."""
     assessment = DroneAssessment(
@@ -223,6 +270,8 @@ def _drone_client() -> OpenMeteoClient:
             return httpx.Response(200, json=_GEOCODE_BODY)
         if request.url.host == "services.swpc.noaa.gov":
             return httpx.Response(200, json=_KP_BODY)
+        if request.url.host.startswith("ensemble"):
+            return httpx.Response(200, json=_ENSEMBLE_BODY)
         return httpx.Response(200, json=_DRONE_BODY)
 
     return OpenMeteoClient(client=httpx.Client(transport=httpx.MockTransport(handler)))
@@ -288,6 +337,8 @@ def test_drone_flight_summary_applies_per_hour_kp_forecast() -> None:
             return httpx.Response(200, json=_GEOCODE_BODY)
         if request.url.host == "services.swpc.noaa.gov":
             return httpx.Response(200, json=kp_forecast)
+        if request.url.host.startswith("ensemble"):
+            return httpx.Response(200, json=_ENSEMBLE_BODY)
         return httpx.Response(200, json=calm_body)
 
     client = OpenMeteoClient(client=httpx.Client(transport=httpx.MockTransport(handler)))
@@ -307,6 +358,91 @@ def test_drone_flight_summary_applies_per_hour_kp_forecast() -> None:
     assert "geomagnetic" in summary
 
 
+def test_drone_flight_summary_flags_forecast_uncertainty() -> None:
+    """A wide ensemble spread near the gust limit surfaces a forecast-confidence caveat."""
+    near_limit_body: dict[str, object] = {
+        "elevation": 120.0,
+        "hourly": {
+            "time": ["2026-06-16T10:00"],
+            "wind_gusts_10m": [40.0],
+            "wind_speed_10m": [30.0],
+            "wind_max_0_500m_kmh": [40.0],  # ~11.1 m/s, just under the 12 m/s limit
+            "temperature_2m": [16.0],
+            "precipitation": [0.0],
+            "precipitation_probability": [0.0],
+            "visibility": [30000.0],
+            "is_day": [1.0],
+            "cape": [0.0],
+        },
+    }
+    wide_ensemble: dict[str, object] = {
+        "hourly": {
+            "time": ["2026-06-16T09:00"],
+            "wind_gusts_10m_member01": [20.0],
+            "wind_gusts_10m_member02": [60.0],  # ~11 m/s spread, far wider than the margin
+        },
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.host.startswith("geocoding"):
+            return httpx.Response(200, json=_GEOCODE_BODY)
+        if request.url.host == "services.swpc.noaa.gov":
+            return httpx.Response(200, json=_KP_BODY)
+        if request.url.host.startswith("ensemble"):
+            return httpx.Response(200, json=wide_ensemble)
+        return httpx.Response(200, json=near_limit_body)
+
+    client = OpenMeteoClient(client=httpx.Client(transport=httpx.MockTransport(handler)))
+
+    summary = render(
+        drone_flight_summary(
+            "Congleton UK", "Mini 5 Pro", client=client, now=_NOW, site_clients=_site_clients([])
+        )
+    )
+
+    assert "Forecast confidence:" in summary
+    assert "ensemble spread" in summary
+
+
+def test_drone_flight_summary_requests_location_timezone() -> None:
+    """The drone forecast is requested in the resolved location's own timezone."""
+    requested: dict[str, str] = {}
+    tokyo_geocode: dict[str, object] = {
+        "results": [
+            {
+                "name": "Tokyo",
+                "country": "Japan",
+                "country_code": "JP",
+                "admin1": "Tokyo",
+                "latitude": 35.68,
+                "longitude": 139.76,
+                "timezone": "Asia/Tokyo",
+            },
+        ],
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.host.startswith("geocoding"):
+            return httpx.Response(200, json=tokyo_geocode)
+        if request.url.host == "services.swpc.noaa.gov":
+            return httpx.Response(503)
+        if request.url.host.startswith("ensemble"):
+            return httpx.Response(503)
+        if "hourly" in request.url.params:  # the drone forecast, not the sun-times almanac
+            requested["timezone"] = request.url.params.get("timezone", "")
+        return httpx.Response(200, json=_DRONE_BODY)
+
+    client = OpenMeteoClient(client=httpx.Client(transport=httpx.MockTransport(handler)))
+
+    _ = render(
+        drone_flight_summary(
+            "Tokyo", "Neo", client=client, now=_NOW, site_clients=_site_clients([])
+        )
+    )
+
+    assert requested["timezone"] == "Asia/Tokyo"
+
+
 def test_drone_flight_summary_survives_kp_outage() -> None:
     """A NOAA Kp failure does not break the assessment (best-effort)."""
 
@@ -315,6 +451,8 @@ def test_drone_flight_summary_survives_kp_outage() -> None:
             return httpx.Response(200, json=_GEOCODE_BODY)
         if request.url.host == "services.swpc.noaa.gov":
             return httpx.Response(503)
+        if request.url.host.startswith("ensemble"):
+            return httpx.Response(200, json=_ENSEMBLE_BODY)
         return httpx.Response(200, json=_DRONE_BODY)
 
     client = OpenMeteoClient(client=httpx.Client(transport=httpx.MockTransport(handler)))

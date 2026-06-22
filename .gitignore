@@ -11,3 +11,5 @@ dist/
 *.egg-info/
 .env
 .claude/
+benchmarks/
+repomix-output.xml

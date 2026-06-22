@@ -50,6 +50,8 @@ _ERR_MESSAGE = "missing message block"
 _ERR_CONTENT = "missing message content"
 _ERR_NOT_JSON = "message content is not JSON"
 _ERR_NOT_OBJECT = "message content is not a JSON object"
+_ERR_FAITHFUL = "'faithful' is not a boolean"
+_ERR_UNDERSTATES = "'understates_risk' is not a boolean"
 
 
 class JudgeError(RuntimeError):
@@ -97,6 +99,29 @@ def facts_for_hour(hour: HourAssessment) -> str:
     return "\n".join(lines)
 
 
+def _require_bool(data: dict[str, object], key: str, context: str) -> bool:
+    """Return a strict JSON boolean field, rejecting truthy strings and numbers.
+
+    ``bool(...)`` would treat the string ``"false"`` or the number ``0`` as a real
+    answer and silently pass an unfaithful verdict, so an actual boolean is required.
+
+    Args:
+        data: The decoded judge object.
+        key: The field to read.
+        context: Error context if the field is missing or not a boolean.
+
+    Returns:
+        The boolean value.
+
+    Raises:
+        JudgeError: If the field is absent or not a JSON boolean.
+    """
+    value = data.get(key)
+    if not isinstance(value, bool):
+        raise JudgeError(context)
+    return value
+
+
 def _parse_judge_response(payload: object) -> JudgeVerdict:
     if not isinstance(payload, dict):
         raise JudgeError(_ERR_BODY)
@@ -113,10 +138,11 @@ def _parse_judge_response(payload: object) -> JudgeVerdict:
     if not isinstance(parsed, dict):
         raise JudgeError(_ERR_NOT_OBJECT)
     data = cast("dict[str, object]", parsed)
+    notes = data.get("notes")
     return JudgeVerdict(
-        faithful=bool(data.get("faithful")),
-        understates_risk=bool(data.get("understates_risk")),
-        notes=str(data.get("notes", "")),
+        faithful=_require_bool(data, "faithful", _ERR_FAITHFUL),
+        understates_risk=_require_bool(data, "understates_risk", _ERR_UNDERSTATES),
+        notes=notes if isinstance(notes, str) else "",
     )
 
 

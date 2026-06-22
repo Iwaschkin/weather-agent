@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from weather_agent.models import SiteBriefing, Verdict
+from weather_agent.models import DataConfidence, SiteBriefing, Verdict
 from weather_agent.reporting import describe_airspace, describe_metar, format_clock
 
 if TYPE_CHECKING:
@@ -46,6 +46,26 @@ def _render_best_window(window: FlightWindow | None) -> str:
     if window is None:
         return "Best window: no good-to-fly hours in the forecast period."
     return f"Best window: {window.start_time} to {window.end_time} ({window.hours} h good to fly)."
+
+
+def _render_confidence(hours: tuple[HourAssessment, ...]) -> list[str]:
+    """Caveat lines for hours capped for missing data or flagged as low-confidence."""
+    insufficient = sum(1 for hour in hours if hour.data_confidence is DataConfidence.INSUFFICIENT)
+    degraded = sum(1 for hour in hours if hour.data_confidence is DataConfidence.DEGRADED)
+    lines: list[str] = []
+    if insufficient:
+        noun = "hour" if insufficient == 1 else "hours"
+        lines.append(
+            f"Data confidence: {insufficient} {noun} had incomplete safety data and were "
+            f"capped at MARGINAL (not GOOD) - treat those as unverified."
+        )
+    if degraded:
+        noun = "hour" if degraded == 1 else "hours"
+        lines.append(
+            f"Forecast confidence: {degraded} {noun} have the gust limit within the ensemble "
+            f"spread - the forecast could cross the limit."
+        )
+    return lines
 
 
 def _render_daylight(sun_times: tuple[DayAlmanac, ...]) -> list[str]:
@@ -200,6 +220,7 @@ def describe_drone_assessment(
         f"Drone flight assessment - {assessment.drone_name} at {assessment.place_label}",
         "",
         _render_best_window(assessment.best_window),
+        *_render_confidence(assessment.hours),
         *_render_briefing(assessment.place_label, briefing),
         "",
         *_render_hours(assessment.hours, max_hours),
@@ -280,6 +301,10 @@ def describe_fleet_assessment(
     briefing_lines = _render_briefing(place_label, briefing)
     if briefing_lines:
         lines.extend(("", *briefing_lines))
+    # All drones share one forecast, so confidence is identical across members.
+    confidence_lines = _render_confidence(members[0].assessment.hours)
+    if confidence_lines:
+        lines.extend(("", *confidence_lines))
     lines.extend(("", *_render_fleet_comparison(members)))
     lines.extend(("", "Per-drone outlook:"))
     for member in members:

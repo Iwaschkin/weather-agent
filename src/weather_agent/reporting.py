@@ -19,6 +19,7 @@ if TYPE_CHECKING:
         CurrentWeather,
         DayAlmanac,
         MetarReport,
+        TafReport,
         TimeSeries,
         UvIndex,
     )
@@ -345,6 +346,21 @@ def describe_metar(place_label: str, report: MetarReport) -> str:
     parts.append(ceiling)
     body = ", ".join(part for part in parts if part) or "no data"
     return f"Nearest METAR for {place_label} - {report.station} (as of {report.observed}): {body}."
+
+
+def describe_taf(place_label: str, report: TafReport) -> str:
+    """Render the nearest airfield's TAF (aviation forecast) as one line.
+
+    Args:
+        place_label: Human-readable location name.
+        report: The nearest TAF forecast.
+
+    Returns:
+        A single line naming the station, issue time, and the raw forecast text.
+    """
+    issued = f" (issued {report.issued})" if report.issued else ""
+    body = report.raw or "no forecast text"
+    return f"Nearest TAF for {place_label} - {report.station}{issued}: {body}"
 
 
 def describe_airspace(place_label: str, airspaces: tuple[Airspace, ...], note: str = "") -> str:

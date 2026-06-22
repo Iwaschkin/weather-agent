@@ -6,14 +6,26 @@ from datetime import datetime
 import pytest
 
 from weather_agent.drone import AVATA_2, MINI_5_PRO, NEO, find_profile
-from weather_agent.flyability import assess_forecast, assess_hour, best_window, daily_outlooks
+from weather_agent.flyability import (
+    assess_forecast,
+    assess_hour,
+    best_window,
+    daily_outlooks,
+    downgrade_for_uncertainty,
+    hourly_gust_spread,
+)
 from weather_agent.models import (
+    DataConfidence,
+    DroneAssessment,
     DroneFlightHour,
     DroneForecast,
     DroneProfile,
+    GateReading,
     HourAssessment,
+    TimeSeries,
     Verdict,
 )
+from weather_agent.policy import NightPolicy
 
 _GOOD_HOUR = DroneFlightHour(
     time="2026-06-16T10:00",
@@ -57,6 +69,7 @@ def test_assess_hour_good_conditions() -> None:
 
     assert result.verdict is Verdict.GOOD
     assert result.limiting_factors == ()
+    assert result.data_confidence is DataConfidence.ADEQUATE
 
 
 def test_assess_hour_no_fly_on_strong_gusts() -> None:
@@ -96,12 +109,26 @@ def test_assess_hour_grades_precipitation_probability(
     assert assess_hour(MINI_5_PRO, hour).verdict is expected
 
 
-def test_assess_hour_no_fly_at_night() -> None:
-    """Night-time hours are no-fly for daylight VLOS."""
+def test_assess_hour_night_is_marginal_under_uk_policy() -> None:
+    """Under the 2026 UK Open Category rules a night hour is marginal, not no-fly."""
     result = assess_hour(MINI_5_PRO, replace(_GOOD_HOUR, is_day=False))
 
+    assert result.verdict is Verdict.MARGINAL
+    assert any("night flight" in factor for factor in result.limiting_factors)
+
+
+def test_assess_hour_night_respects_a_custom_policy() -> None:
+    """Night handling is policy-driven: a no-fly night policy yields no-fly."""
+    strict = NightPolicy(
+        jurisdiction="test",
+        effective_date="2026-01-01",
+        verdict=Verdict.NO_FLY,
+        note="night flight prohibited",
+    )
+    result = assess_hour(MINI_5_PRO, replace(_GOOD_HOUR, is_day=False), night_policy=strict)
+
     assert result.verdict is Verdict.NO_FLY
-    assert any("night" in factor for factor in result.limiting_factors)
+    assert any("prohibited" in factor for factor in result.limiting_factors)
 
 
 def test_assess_hour_marginal_when_cold() -> None:
@@ -199,6 +226,52 @@ def test_assess_hour_marginal_when_wind_unavailable() -> None:
 
     assert result.verdict is Verdict.MARGINAL
     assert result.governing_wind_ms is None
+
+
+@pytest.mark.parametrize(
+    ("field", "expected_factor"),
+    [
+        ({"temperature_c": None}, "temperature data unavailable"),
+        (
+            {"precipitation_mm": None, "precipitation_probability_pct": None},
+            "precipitation data unavailable",
+        ),
+        ({"visibility_m": None}, "visibility data unavailable"),
+        ({"is_day": None}, "daylight data unavailable"),
+    ],
+)
+def test_assess_hour_marginal_when_safety_data_missing(
+    field: dict[str, object], expected_factor: str
+) -> None:
+    """Missing safety-critical inputs degrade to marginal, never good.
+
+    Regression for the fail-open hole: an absent temperature, precipitation,
+    visibility, or daylight value previously read as GOOD, which could fabricate
+    a clear-to-fly window from incomplete data.
+    """
+    hour = replace(_GOOD_HOUR, **field)
+    result = assess_hour(MINI_5_PRO, hour)
+
+    assert result.verdict is Verdict.MARGINAL
+    assert expected_factor in result.limiting_factors
+    assert result.data_confidence is DataConfidence.INSUFFICIENT
+
+
+def test_assess_hour_good_when_measured_precip_zero_without_probability() -> None:
+    """A measured 0 mm with no probability stays good - it is a real no-rain signal."""
+    hour = replace(_GOOD_HOUR, precipitation_mm=0.0, precipitation_probability_pct=None)
+    result = assess_hour(MINI_5_PRO, hour)
+
+    assert result.verdict is Verdict.GOOD
+    assert result.data_confidence is DataConfidence.ADEQUATE
+
+
+def test_assess_hour_confidence_independent_of_verdict() -> None:
+    """A real borderline (cold) is marginal but data-adequate - the axes are separate."""
+    result = assess_hour(MINI_5_PRO, replace(_GOOD_HOUR, temperature_c=2.0))
+
+    assert result.verdict is Verdict.MARGINAL
+    assert result.data_confidence is DataConfidence.ADEQUATE
 
 
 def test_assess_hour_exposes_structured_readings() -> None:
@@ -359,3 +432,69 @@ def test_assess_forecast_all_past_yields_no_window() -> None:
 
     assert assessment.hours == ()
     assert assessment.best_window is None
+
+
+def test_hourly_gust_spread_is_member_range_in_ms() -> None:
+    """Spread is the max-min of member gusts per hour, converted km/h to m/s."""
+    series = TimeSeries(
+        timestamps=("2026-06-16T09:00", "2026-06-16T10:00"),
+        series={
+            "wind_gusts_10m_member01": (10.0, 18.0),
+            "wind_gusts_10m_member02": (28.0, 18.0),
+        },
+    )
+
+    spread = hourly_gust_spread(series)
+
+    # 09:00 -> (28-10)/3.6 = 5.0 m/s; 10:00 -> members equal -> 0.0.
+    assert spread == {"2026-06-16T09:00": 5.0, "2026-06-16T10:00": 0.0}
+
+
+def _wind_hour(
+    wind_ms: float,
+    threshold: float,
+    confidence: DataConfidence = DataConfidence.ADEQUATE,
+) -> HourAssessment:
+    return HourAssessment(
+        time="2026-06-16T10:00",
+        verdict=Verdict.GOOD,
+        limiting_factors=(),
+        governing_wind_ms=wind_ms,
+        readings=(GateReading("wind_gust", Verdict.GOOD, value=wind_ms, threshold=threshold),),
+        data_confidence=confidence,
+    )
+
+
+def _one_hour_assessment(hour: HourAssessment) -> DroneAssessment:
+    return DroneAssessment(drone_name="x", place_label="y", hours=(hour,), best_window=None)
+
+
+def test_downgrade_for_uncertainty_flags_wind_within_spread_of_limit() -> None:
+    """A gust limit within one ensemble spread of the forecast wind is low-confidence."""
+    assessment = _one_hour_assessment(_wind_hour(10.0, 12.0))
+
+    result = downgrade_for_uncertainty(assessment, {"2026-06-16T10:00": 3.0})
+
+    # |12 - 10| = 2 <= 3 -> the members plausibly cross the limit.
+    assert result.hours[0].data_confidence is DataConfidence.DEGRADED
+
+
+def test_downgrade_for_uncertainty_leaves_confident_wind_adequate() -> None:
+    """A limit comfortably outside the spread keeps the hour adequate."""
+    assessment = _one_hour_assessment(_wind_hour(10.0, 12.0))
+
+    result = downgrade_for_uncertainty(assessment, {"2026-06-16T10:00": 1.0})
+
+    # |12 - 10| = 2 > 1 -> confident.
+    assert result.hours[0].data_confidence is DataConfidence.ADEQUATE
+
+
+def test_downgrade_for_uncertainty_keeps_insufficient_hours() -> None:
+    """Missing-data hours stay INSUFFICIENT; uncertainty never upgrades them."""
+    assessment = _one_hour_assessment(
+        _wind_hour(10.0, 12.0, confidence=DataConfidence.INSUFFICIENT)
+    )
+
+    result = downgrade_for_uncertainty(assessment, {"2026-06-16T10:00": 5.0})
+
+    assert result.hours[0].data_confidence is DataConfidence.INSUFFICIENT

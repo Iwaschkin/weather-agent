@@ -13,6 +13,7 @@ from weather_agent.parsing import (
     parse_elevation,
     parse_geocode_results,
     parse_metars,
+    parse_tafs,
     parse_time_series,
     parse_uv_index,
 )
@@ -52,6 +53,7 @@ def test_parse_geocode_results_extracts_disambiguation_fields() -> None:
                 "population": 26482,
                 "latitude": 53.16,
                 "longitude": -2.21,
+                "timezone": "Europe/London",
             },
         ],
     }
@@ -61,6 +63,7 @@ def test_parse_geocode_results_extracts_disambiguation_fields() -> None:
     assert result.country_code == "GB"
     assert result.admin1 == "England"
     assert result.population == 26482
+    assert result.timezone == "Europe/London"
 
 
 def test_parse_geocode_results_defaults_disambiguation_fields() -> None:
@@ -74,6 +77,7 @@ def test_parse_geocode_results_defaults_disambiguation_fields() -> None:
     assert result.country_code == ""
     assert result.admin1 == ""
     assert result.population is None
+    assert result.timezone == ""
 
 
 def test_parse_geocode_results_missing_results_is_empty() -> None:
@@ -209,6 +213,33 @@ def test_parse_metars_rejects_non_list() -> None:
     """A non-array METAR payload raises an aviation error."""
     with pytest.raises(AviationError):
         _ = parse_metars({"not": "a list"})
+
+
+def test_parse_tafs_extracts_fields_and_skips_malformed() -> None:
+    """A TAF entry's id, coordinates, issue time, and raw text are parsed."""
+    payload: list[object] = [
+        {
+            "icaoId": "EGCC",
+            "lat": 53.35,
+            "lon": -2.28,
+            "issueTime": "2026-06-16 11:30:00",
+            "rawTAF": "TAF EGCC 161130Z 1612/1712 24012KT",
+        },
+        {"lat": 1.0, "lon": 2.0},  # no id -> skipped
+    ]
+
+    reports = parse_tafs(payload)
+
+    assert len(reports) == 1
+    assert reports[0].station == "EGCC"
+    assert reports[0].issued == "2026-06-16 11:30:00"
+    assert reports[0].raw.startswith("TAF EGCC")
+
+
+def test_parse_tafs_rejects_non_list() -> None:
+    """A non-array TAF payload raises an aviation error."""
+    with pytest.raises(AviationError):
+        _ = parse_tafs({"not": "a list"})
 
 
 def test_parse_airspaces_maps_codes_and_limits() -> None:

@@ -13,6 +13,8 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import TYPE_CHECKING, Any
 
+from weather_agent.models import DataConfidence
+
 if TYPE_CHECKING:
     from weather_agent.models import DroneAssessment, FleetAssessment, FleetMember
 
@@ -27,6 +29,8 @@ class DroneView:
     summary: str
     rows: list[dict[str, Any]]
     verdicts: list[str]
+    incomplete_hours: int
+    low_confidence_hours: int
 
 
 def _round(value: float | None) -> float | None:
@@ -96,6 +100,12 @@ def drone_view(member: FleetMember) -> DroneView:
         summary=_summary(assessment),
         rows=_rows(assessment),
         verdicts=[hour.verdict.value for hour in assessment.hours],
+        incomplete_hours=sum(
+            1 for hour in assessment.hours if hour.data_confidence is DataConfidence.INSUFFICIENT
+        ),
+        low_confidence_hours=sum(
+            1 for hour in assessment.hours if hour.data_confidence is DataConfidence.DEGRADED
+        ),
     )
 
 

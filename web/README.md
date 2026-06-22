@@ -2,11 +2,12 @@
 
 A [Reflex](https://reflex.dev) dashboard over the `weather_agent` package: pick a
 location and a horizon of up to 7 days, and see a graphical per-drone flyability
-forecast with an AI-generated briefing for each drone.
+forecast with an AI-generated briefing for each drone. A linked **Benchmark** page
+runs the agent's cost / tool-routing benchmark from the browser.
 
-It is a thin UI layer — all weather logic lives in the `weather_agent` package
+It is a thin UI layer — all logic lives in the `weather_agent` package
 (`assess_fleet` for the structured forecast, `generate_drone_report` for the
-grounded LLM report). This app only renders.
+grounded LLM report, `run_benchmark` for the benchmark). This app only renders.
 
 ## Prerequisites
 
@@ -39,6 +40,16 @@ and compiles the app, so it takes a little longer.
   or visibility.
 - Per drone: an animated chart of the selected metric, a GOOD/MARGINAL/NO-FLY colour
   ribbon, the best flying window, and an AI briefing that appears once generated.
+- Per drone, a confidence note when applicable: some hours had incomplete safety
+  data (capped at marginal, not good), or the gust limit sits within the ensemble
+  spread (the forecast could cross it).
+
+## Benchmark page
+
+The **Benchmark** link (top right) opens `/benchmark`: a one-click run of the
+cost / tool-routing benchmark over a fixed query set, showing aggregate tokens,
+model latency (mean / p50 / p95), and a per-tool routing table. It runs the agent
+for several queries, so it needs a running Ollama server.
 
 Decision support only — not legal or airworthiness advice. Always verify airspace,
 Flight Restriction Zones, and NOTAMs before flying.
