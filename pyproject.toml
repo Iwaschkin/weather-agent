@@ -13,7 +13,7 @@ dependencies = [
     "httpx>=0.28.1",
     "python-dotenv>=1.0.1",
     "strands-agents[ollama]>=1.43.0",
-    "tzdata>=2026.2",
+    "tzdata>=2026.3",
 ]
 
 [project.scripts]
@@ -26,14 +26,14 @@ build-backend = "uv_build"
 [dependency-groups]
 dev = [
     "pre-commit>=4.6.0",
-    "pyright>=1.1.410",
-    "pytest>=9.1.0",
+    "pyright>=1.1.411",
+    "pytest>=9.1.1",
     "pytest-asyncio>=1.4.0",
     "pytest-cov>=7.1.0",
-    "ruff>=0.15.17",
+    "ruff>=0.15.21",
 ]
 web = [
-    "reflex>=0.9.5.post2",
+    "reflex>=0.9.6.post1",
 ]
 
 [tool.ruff]
