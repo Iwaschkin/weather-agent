@@ -17,6 +17,10 @@ There are three kinds of knob, and this manual is organised around the distincti
 There is **no** settings file, no CLI flags beyond the `chat` subcommand, and no
 environment variable for the model or host (see [LLM / Ollama](#3-llm--ollama-weather_agentagent)).
 
+The optional Reflex dashboard needs the `web` dependency group and the system
+`unzip` command for its first Bun/frontend build. Its clean production smoke command
+is `cd web && uv run reflex export --frontend-only --no-zip`.
+
 ---
 
 ## 1. Command line (`weather_agent.cli`)
@@ -77,6 +81,13 @@ agent = build_agent(model_id="qwen3:30b-a3b", host="http://localhost:11434")
 Conversation memory in `chat` mode is a sliding window managed by the Strands
 `Agent`; its size is not configured here.
 
+Drone tool calls also write a typed `DroneResponse` into a `DecisionCapture` held in
+Strands `invocation_state`. The capture is created per CLI turn and is never global.
+`callback_handler=None` installs Strands' null callback so no model tokens are printed
+before the CLI selects output. When a drone response was captured, `_run_agent_turn`
+prints its deterministic text and discards the model's final rewrite; other tools keep
+the normal model response.
+
 ---
 
 ## 4. HTTP boundary clients
@@ -93,9 +104,11 @@ client.
 
 | Constant | File | Default | Effect |
 | --- | --- | --- | --- |
-| `_DEFAULT_TIMEZONE` | `client.py` | `Europe/London` | Time zone requested for forecast endpoints, so hourly timestamps are UK-local. |
+| `_DEFAULT_TIMEZONE` | `client.py` | `Europe/London` | Time zone requested only for the GB-scoped drone forecast, so its hourly instants follow UK civil time. |
 | `_DEFAULT_SEARCH_DEGREES` | `aviation.py` | `1.0` | METAR search box half-extent in degrees. |
+| `_MAX_SEARCH_DEGREES` | `aviation.py` | `5.0` | Maximum accepted METAR search half-extent; non-positive/non-finite values fail before I/O. |
 | `_DEFAULT_RADIUS_M` | `openaip.py` | `15000` | Airspace search radius in metres. |
+| `_MAX_RADIUS_M` | `openaip.py` | `100000` | Maximum accepted OpenAIP radius; non-positive values fail before I/O. |
 | `_MAX_RESULTS` | `openaip.py` | `50` | Max airspace volumes requested. |
 | `_RELEVANT_TYPE_LABELS` | `openaip.py` | Restricted, Danger, Prohibited, CTR, TMZ, RMZ, ATZ, MATZ, MCTR, HTZ | Airspace types kept (low-level, drone-relevant); others are filtered out. |
 
@@ -119,6 +132,26 @@ All key-free except OpenAIP. Change only if proxying or self-hosting.
 | `_METAR_URL` | `https://aviationweather.gov/api/data/metar` |
 | `_AIRSPACES_URL` | `https://api.core.openaip.net/api/airspaces` |
 
+### Time and calendar contract
+
+All Open-Meteo endpoints that return dates or instants request `timeformat=unixtime`.
+Worldwide current, daily, historical, climate, air-quality, marine, flood, ensemble,
+UV, solar, and sun-time calls use `timezone=auto`; their parsed models retain the
+provider's IANA timezone, abbreviation, and UTC offset. Daily rows are calendar
+`date` values in that resolved zone, while current/hourly rows are aware `datetime`
+instants. Reports name the relevant zone at the presentation edge.
+
+The GB-only drone assessment deliberately requests `Europe/London`. Its comparisons
+use aware instants, including across the spring and autumn DST changes. Kp and METAR
+timestamps are reconciled in UTC, and a best window requires genuinely adjacent
+one-hour instants rather than merely adjacent response rows.
+
+Every spatial provider accepts a frozen `Coordinates` value containing finite WGS84
+latitude `[-90, 90]` and longitude `[-180, 180]`. Geocoding and raw-coordinate tools
+construct it before I/O; invalid pairs return an invalid-input outcome. A successful
+HTTP response that is not JSON becomes the provider-specific typed error rather than
+escaping as a decoder exception.
+
 ---
 
 ## 5. Data-source routing (`weather_agent.routing`)
@@ -130,6 +163,9 @@ today using these two constants.
 | --- | --- | --- | --- |
 | `FORECAST_HORIZON_DAYS` | `routing.py` | `16` | Dates within this many days ahead use the forecast; beyond it, the climate projection. Also the upper bound for the `days` parameter on `get_forecast`, `get_solar_potential`, and `get_sun_times`. |
 | `ARCHIVE_LATENCY_DAYS` | `routing.py` | `5` | Dates older than this use the ERA5 archive; more recent past dates are served by the forecast endpoint (ERA5 publication lag). |
+| `ARCHIVE_START_DATE` | `client.py` | `1940-01-01` | Earliest accepted archive day. |
+| `CLIMATE_START_DATE` / `CLIMATE_END_DATE` | `client.py` | `1950-01-01` / `2050-01-01` | Inclusive accepted climate-projection bounds. |
+| `MAX_DAILY_RANGE_DAYS` | `client.py` | `3660` | Maximum inclusive archive/climate range per request. |
 
 ---
 
@@ -172,8 +208,9 @@ functions and clients (useful for tests or embedding):
 | Parameter | Where | Default | Effect |
 | --- | --- | --- | --- |
 | `client` | every `*_summary` / domain function | `None` | Inject an `OpenMeteoClient` (or mock); created and closed per call when omitted. |
-| `today` | `weather_for_date`, `historical_summary`, `climate_summary`, `compare_periods` | current UTC date | Reference date for resolving relative phrases (deterministic tests). |
-| `now` | `drone_flight_summary`, `fleet_flight_summary` | current UK-local time | Hours before this are dropped from the outlook. |
+| `today` | `weather_for_date`, `historical_summary`, `climate_summary`, `compare_periods` | current date in the resolved location's IANA zone | Optional reference date for resolving relative phrases (primarily for deterministic tests). |
+| `now` | `drone_flight_summary`, `fleet_flight_summary`, `aviation_summary` | current aware time | Drops elapsed forecast hours and determines whether a METAR is current. |
+| `today` | `OpenMeteoClient` | current UTC date | Optional deterministic seam for dynamic forecast/archive request windows. |
 | `site_clients` | `drone_flight_summary`, `fleet_flight_summary` | `None` | Inject `AviationClient` / `OpenAipClient` for the METAR and airspace lookups. |
 | `count` | `OpenMeteoClient.geocode` | `10` | Candidate matches requested for disambiguation. |
 
@@ -196,11 +233,29 @@ reports an invalid-input message rather than guessing.
 | --- | --- | --- | --- |
 | `_OFFSETS` | `dates.py` | the fixed-offset table above | Maps each exact phrase to a day offset. |
 | `_WEEKDAYS` | `dates.py` | Mon–Sun | Recognised weekday names. |
+| `MAX_RELATIVE_DAYS` | `dates.py` | `36525` | Largest counted day/week offset accepted before date arithmetic. |
 
 Weekday rule: `monday` / `this monday` / `next monday` all mean the **next**
 occurrence after today; `last monday` means the most recent before today. Range
 phrases (`this weekend`, `last summer`, `next week`) are intentionally **not**
 supported — they describe a range, not a single day.
+
+### METAR freshness contract
+
+The Aviation Weather Center describes METARs as terminal observations, serves the
+latest report, updates its current cache once a minute, and shows routine observations
+on an hourly timeline: <https://aviationweather.gov/data/api/> and
+<https://aviationweather.gov/impactboard/help.html>. Based on that cadence, this
+project allows one missed routine cycle: `_METAR_MAX_AGE=2 hours`. It tolerates at
+most `_METAR_MAX_FUTURE=15 minutes` of clock skew and requires a forecast comparison
+within `_METAR_MAX_COMPARISON_GAP=90 minutes`. These are application freshness bounds,
+not claims that an observation remains operationally authoritative for two hours.
+
+Open-Meteo's official marine contract defaults `cell_selection=sea`, preferring a sea
+grid cell for supplied coordinates: <https://open-meteo.com/en/docs/marine-weather-api>.
+It does not document a 400 reason that proves a point is inland. Consequently, every
+marine 400 remains a provider failure; the application never infers “inland” from the
+status code alone.
 
 ---
 
@@ -244,50 +299,75 @@ period) render with a humanised name and no band. To add a band, add an entry to
 
 ## 10. Drone flyability rules engine (`weather_agent.flyability`)
 
-Every threshold that turns a forecast hour into a `GOOD` / `MARGINAL` / `NO-FLY`
-verdict. These are the safety-relevant switches; edit with care.
+Every threshold that turns a forecast hour into a `GOOD` / `MARGINAL` / `UNKNOWN` /
+`NO-FLY` verdict. These are the safety-relevant switches; edit with care.
 
 | Constant | Default | Effect |
 | --- | --- | --- |
 | `_PRECIP_PROBABILITY_MARGINAL_PCT` | `20.0` | Above this rain chance → MARGINAL. |
 | `_PRECIP_PROBABILITY_NO_FLY_PCT` | `50.0` | At/above this rain chance → NO-FLY. Any *measured* precipitation (> 0 mm) is always NO-FLY. |
-| `_VISIBILITY_MARGINAL_M` | `5000.0` | Base visibility (m) below which the hour is MARGINAL (adjusted by sensing, below). |
+| `_VISIBILITY_MARGINAL_M` | `5000.0` | Visibility (m) below which the hour is MARGINAL. Aircraft sensing never relaxes this pilot/VLOS input. |
 | `_LOW_CLOUD_MARGINAL_PCT` | `90.0` | Low-cloud cover at/above this → MARGINAL (low-ceiling proxy). |
 | `_CAPE_MARGINAL` | `1000.0` | CAPE (J/kg) above this → MARGINAL (storm potential). |
 | `_COLD_CAUTION_C` | `5.0` | At/below this temperature → cold caution (battery). Outside the profile's `min/max_temp_c` envelope is NO-FLY. |
 | `_ICING_CEILING_M` | `500.0` | Freezing level (AGL) below this → icing caution. |
 | `_KP_CAUTION` | `5.0` | Planetary Kp at/above this → GNSS/compass caution. |
 | `_FPV_GUST_FACTOR` | `0.85` | FPV airframes get both gust limits multiplied by this (tighter, safety-biased). |
-| `_NO_OMNI_VISIBILITY_PENALTY_M` | `3000.0` | Added to the marginal-visibility threshold for drones without omnidirectional sensing. |
-| `_LOW_LIGHT_VISIBILITY_BONUS_M` | `2000.0` | Subtracted from it for low-light-capable drones. |
 | `_KMH_PER_MS` | `3.6` | km/h ↔ m/s conversion (winds are reported in km/h, limits in m/s). |
 
 Wind verdict (per drone, after the FPV factor): governing wind `>` caution limit →
 NO-FLY; `>` ideal limit → MARGINAL; else GOOD. The governing wind is the worst wind
 across 0–500 m AGL.
 
+`GOOD` additionally requires every requested core weather sample to be present,
+finite, and inside its physical domain. An isolated provider `null` produces
+`UNKNOWN`, which is excluded from good-hour counts and best windows. A known
+NO-FLY condition remains NO-FLY even when another value is missing. Supplemental
+NOAA Kp is not converted into a successful gate when absent: the report carries a
+typed source status, and each Kp row covers only its published three-hour UTC bucket.
+
 ---
 
 ## 11. Drone profiles (`weather_agent.drone`)
 
-The per-drone data the engine reads. All three share the DJI consumer temperature
+The per-configuration data the engine reads. All configurations share the DJI consumer temperature
 envelope `_MIN_TEMP_C=-10.0` / `_MAX_TEMP_C=40.0`.
 
-| Field | DJI Neo | DJI Avata 2 | DJI Mini 5 Pro |
-| --- | --- | --- | --- |
-| `weight_g` | 135.0 | 377.0 | 249.9 |
-| `ideal_gust_ms` | 5.0 | 7.0 | 8.0 |
-| `caution_gust_ms` | 8.0 | 10.7 | 12.0 |
-| `is_fpv` | yes | yes | no |
-| `has_omni_sensing` | no | no | yes |
-| `low_light_capable` | no | no | yes |
+| Configuration | Weight | Mark | Current UK subcategory | FPV | Wind limit |
+| --- | --- | --- | --- | --- | --- |
+| DJI Neo, standard operation | 135.0 g | EU C0 | A1 | no | 8.0 m/s |
+| DJI Neo, FPV operation | 135.0 g | EU C0 | A1 | yes | 8.0 m/s (then FPV margin) |
+| DJI Avata 2 | 377.0 g | EU C1 | A1 | yes | 10.7 m/s (then FPV margin) |
+| DJI Mini 5 Pro, standard battery | 249.9 g | EU C0 | A1 | no | 12.0 m/s |
+| DJI Mini 5 Pro, Plus battery/C1 bundle | approx. 295.7 g | EU C1 | A1 | no | 12.0 m/s |
 
 Accepted names/aliases (`_ALIASES`, case-insensitive): `neo` / `dji neo`;
+`neo fpv` / `dji neo fpv`;
 `avata` / `avata2` / `avata 2` / `dji avata 2`; `mini` / `mini5` / `mini5pro` /
-`mini 5 pro` / `dji mini 5 pro`.
+`mini 5 pro` / `dji mini 5 pro`; and `mini plus` / `mini 5 pro plus`.
 
 To add a drone: define a `DroneProfile`, append it to `DRONE_PROFILES`, and add its
-aliases to `_ALIASES`. UK CAA category follows automatically from `weight_g`.
+aliases to `_ALIASES`. Supply the actual configuration mark, current subcategory,
+manufacturer source, and review date explicitly. Weight never creates a class mark.
+
+EU C0/C1 recognition as the corresponding UK operating class through 31 December 2027
+does not turn the aircraft into a UK0/UK1-marked product. In particular, do not apply the
+UK1 Remote ID deadline to an EU C1 profile: the supported EU-marked configurations use
+the CAA's 1 January 2028 transitional deadline. This distinction is enforced in
+`tests/test_caa.py`.
+
+### Regulatory provenance and review triggers
+
+| Topic | Official source | Reviewed | Next review trigger |
+| --- | --- | --- | --- |
+| Class marks, legacy weights, EU transition | <https://www.caa.co.uk/drones/open-category/getting-started-with-drones-and-model-aircraft/class-marks/> | 2026-07-12 | Any CAA update and before 2027-12-31 |
+| A1/A2/A3 people and place rules | <https://www.caa.co.uk/drones/open-category/getting-started-with-drones-and-model-aircraft/where-you-can-fly/> | 2026-07-12 | Any Drone Code release |
+| Height and commissioned tall structures | <https://www.caa.co.uk/drones/open-category/drone-code/less-common-flying-points-37-to-39/> | 2026-07-12 | Any Drone Code release |
+| FPV observer | <https://www.caa.co.uk/drones/open-category/moving-on-to-more-advanced-flying/first-person-view-fpv/> | 2026-07-12 | Any CAA FPV update |
+| Flyer/Operator IDs | <https://www.caa.co.uk/drones/open-category/getting-started-with-drones-and-model-aircraft/registering-to-fly-drones-and-model-aircraft/> | 2026-07-12 | Any registration-rule update |
+| Night green light | <https://www.caa.co.uk/drones/open-category/getting-started-with-drones-and-model-aircraft/flying-at-night-in-the-open-category/> | 2026-07-12 | Any CAA night-flight update |
+| Remote ID | <https://www.caa.co.uk/drones/open-category/moving-on-to-more-advanced-flying/remote-id-rid/> | 2026-07-12 | Any RID update and before 2028-01-01 |
+| Aircraft configuration marks/specs | DJI profile URLs embedded in `DroneProfile` | 2026-07-12 | Manufacturer spec/firmware or bundle change |
 
 | Constant | File | Default | Effect |
 | --- | --- | --- | --- |
@@ -324,17 +404,27 @@ Keyword retrieval over the curated drone tips file.
 
 ---
 
-## 14. Evaluation harnesses
+## 14. Evaluation harnesses and output authority
 
-Two independent ways to check explanation quality.
+The runtime authority boundary and the offline evaluation aids serve different jobs.
 
-### Deterministic guardrail (`weather_agent.evaluation`) — always on
+### Runtime authority (`weather_agent.application`, `reporting_llm`)
+
+- CLI drone decisions cross the model/tool boundary in a request-local typed capture.
+  The deterministic report is selected after the complete Strands turn, so the model's
+  final prose cannot replace it.
+- The dashboard renders its deterministic report before optional generated content.
+- `generate_drone_report` asks Ollama for exactly `summary` and `preflight_note` in
+  JSON. Structural drift, empty or overlong fields, and flight-decision language cause
+  `ReportError`; the dashboard omits that commentary while retaining the decision.
+
+### Lexical evaluation (`weather_agent.evaluation`) — offline aid only
 
 - `check_hour_explanation(explanation, hour)` flags prose that understates a verdict
   or omits a limiting factor.
-- `audit_drone_report(assessment, report)` runs that across an assessment; the drone
-  report prepends a safety banner if it fires (`_SAFETY_BANNER` in `weather.py`).
-  No configuration; runs as part of normal report generation and the test suite.
+- `audit_drone_report(assessment, report)` runs that signal across an assessment.
+  Its substring heuristics are retained for evaluation tests only; they are not a
+  runtime semantic guardrail and do not authorize displayed model prose.
 
 ### Opt-in LLM-as-judge (`weather_agent.eval_llm`) — offline only
 
@@ -381,9 +471,12 @@ Per-file rule relaxations: `print` is allowed in `cli.py` only; tests drop
 
 ## 16. Web dashboard (`web/`)
 
-An optional [Reflex](https://reflex.dev) UI over `assess_fleet` and
-`generate_drone_report`. It is a separate app outside the strict `src/` baseline
-(`web/` is ruff-excluded and outside the Pyright include).
+An optional [Reflex](https://reflex.dev) UI over `assess_fleet` and optional
+`generate_drone_report` commentary. The optional runtime dependency remains in the
+`web` group, but the shipped surface is inside the quality contract: Ruff covers the
+whole tree, Pyright includes the typed transform and state boundaries, focused pytest
+tests exercise components and request coordination, and CI imports and production-builds
+the app.
 
 | Knob | Where | Default | Effect |
 | --- | --- | --- | --- |
@@ -392,7 +485,7 @@ An optional [Reflex](https://reflex.dev) UI over `assess_fleet` and
 | `days` selector | `web/.../components.py` | 1–7 (default 5) | Forecast horizon; passed to `assess_fleet`, capped at `_MAX_DRONE_FORECAST_DAYS`. |
 | `metric` toggle | dashboard UI | `wind` | Charted metric: `wind` (with limit line), `precip`, `temp`, `vis`. |
 | theme | `web/.../weather_dashboard.py` | dark / cyan | `rx.theme(appearance=..., accent_color=...)`; edit to restyle. |
-| LLM host/model | `reporting_llm` defaults | `http://localhost:11434` / `gemma4:12b` | The dashboard calls `generate_drone_report` with the module defaults; needs Ollama running for the AI briefing (charts work without it). |
+| LLM host/model | `reporting_llm` defaults | `http://localhost:11434` / `gemma4:12b` | Optional commentary only. The deterministic assessment remains complete when Ollama is absent or its JSON is rejected. |
 
 Run it:
 

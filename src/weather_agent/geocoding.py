@@ -99,10 +99,6 @@ def _matches_qualifier(candidate: GeocodeResult, qualifier: str) -> bool:
     )
 
 
-def _by_population(candidate: GeocodeResult) -> int:
-    return candidate.population or 0
-
-
 # How many times more populous a namesake must be to override the API's
 # relevance order. Below this ratio the most-relevant (first) candidate wins; at
 # or above it a clearly bigger place (a major city vs an obscure namesake) wins.
@@ -125,8 +121,13 @@ def _most_relevant(candidates: Sequence[GeocodeResult]) -> GeocodeResult:
         The chosen match.
     """
     top = candidates[0]
-    most_populous = max(candidates, key=_by_population)
-    if _by_population(most_populous) >= _DOMINANT_POPULATION_RATIO * _by_population(top):
+    top_population = top.population
+    known = [candidate for candidate in candidates if (candidate.population or 0) > 0]
+    if top_population is None or top_population <= 0 or not known:
+        return top
+    most_populous = max(known, key=lambda candidate: candidate.population or 0)
+    population = most_populous.population
+    if population is not None and population >= _DOMINANT_POPULATION_RATIO * top_population:
         return most_populous
     return top
 
@@ -154,6 +155,5 @@ def select_best_match(
         return None
     if qualifier:
         matching = [c for c in candidates if _matches_qualifier(c, qualifier)]
-        if matching:
-            return _most_relevant(matching)
+        return _most_relevant(matching) if matching else None
     return _most_relevant(candidates)

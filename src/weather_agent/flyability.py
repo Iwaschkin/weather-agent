@@ -11,7 +11,7 @@ deliberately conservative and named for tuning.
 from __future__ import annotations
 
 from dataclasses import replace
-from datetime import datetime
+from datetime import UTC, date, datetime, timedelta
 from typing import TYPE_CHECKING
 
 from weather_agent.models import (
@@ -45,26 +45,14 @@ _KP_CAUTION = 5.0
 # FPV airframes are flown faster and are less forgiving in gusts than the raw wind
 # rating implies, so both gust thresholds are tightened for them (safety-biased).
 _FPV_GUST_FACTOR = 0.85
-# Reduced visibility is riskier without omnidirectional obstacle sensing and safer
-# for a low-light-capable airframe (e.g. LiDAR), so the marginal visibility
-# threshold adapts to the drone's sensing stack.
-_NO_OMNI_VISIBILITY_PENALTY_M = 3000.0
-_LOW_LIGHT_VISIBILITY_BONUS_M = 2000.0
+_ONE_HOUR = timedelta(hours=1)
 
-_SEVERITY = {Verdict.GOOD: 0, Verdict.MARGINAL: 1, Verdict.NO_FLY: 2}
-
-
-def _parse_hour_or_none(time_str: str) -> datetime | None:
-    """Parse an open-meteo naive-local hour timestamp, or None if unparseable.
-
-    A total conversion: open-meteo returns ISO ``YYYY-MM-DDTHH:MM`` local
-    timestamps, but an unexpected value must not crash the assessment, so it
-    maps to ``None`` and the caller keeps the hour rather than dropping data.
-    """
-    try:
-        return datetime.fromisoformat(time_str)
-    except ValueError:
-        return None
+_SEVERITY = {
+    Verdict.GOOD: 0,
+    Verdict.MARGINAL: 1,
+    Verdict.UNKNOWN: 2,
+    Verdict.NO_FLY: 3,
+}
 
 
 def _future_hours(
@@ -75,20 +63,20 @@ def _future_hours(
 
     Args:
         hours: Forecast hours in chronological order.
-        now: Current naive local time; when ``None`` no filtering happens.
+        now: Current aware instant; when ``None`` no filtering happens.
 
     Returns:
-        Only hours at or after the start of the current hour. Hours whose
-        timestamp cannot be parsed are kept (fail-open, never hide data).
+        Only hours at or after the start of the current hour. Forecast timestamps
+        are already validated at the provider boundary.
     """
     if now is None:
         return hours
+    if now.tzinfo is None:
+        message = "now must be timezone-aware"
+        raise ValueError(message)
     cutoff = now.replace(minute=0, second=0, microsecond=0)
-    return tuple(
-        hour
-        for hour in hours
-        if (parsed := _parse_hour_or_none(hour.time)) is None or parsed >= cutoff
-    )
+    cutoff_utc = cutoff.astimezone(UTC)
+    return tuple(hour for hour in hours if hour.time.astimezone(UTC) >= cutoff_utc)
 
 
 def _governing_wind_ms(hour: DroneFlightHour) -> float | None:
@@ -110,7 +98,7 @@ def _effective_gust_limits(profile: DroneProfile) -> tuple[float, float]:
 def _wind_gate(profile: DroneProfile, governing_ms: float | None) -> GateReading:
     ideal, caution = _effective_gust_limits(profile)
     if governing_ms is None:
-        return GateReading("wind_gust", Verdict.MARGINAL, "wind data unavailable", unit="m/s")
+        return GateReading("wind_gust", Verdict.UNKNOWN, "wind data unavailable", unit="m/s")
     fpv = " (FPV: reduced gust margin)" if profile.is_fpv else ""
     if governing_ms > caution:
         band = Verdict.NO_FLY
@@ -130,20 +118,27 @@ def _wind_gate(profile: DroneProfile, governing_ms: float | None) -> GateReading
 
 
 def _precipitation_gate(hour: DroneFlightHour) -> GateReading:
-    if hour.precipitation_mm is not None and hour.precipitation_mm > 0:
+    precipitation = hour.precipitation_mm
+    probability = hour.precipitation_probability_pct
+    if precipitation is not None and precipitation > 0:
         return GateReading(
             "precipitation",
             Verdict.NO_FLY,
             "precipitation expected (drone is not water-resistant)",
-            value=hour.precipitation_mm,
+            value=precipitation,
             unit="mm",
         )
-    probability = hour.precipitation_probability_pct
     threshold = _PRECIP_PROBABILITY_NO_FLY_PCT
-    if probability is None:
-        return GateReading("precip_probability", Verdict.GOOD, unit="%", threshold=threshold)
-    if probability >= _PRECIP_PROBABILITY_NO_FLY_PCT:
+    if probability is not None and probability >= _PRECIP_PROBABILITY_NO_FLY_PCT:
         band = Verdict.NO_FLY
+    elif precipitation is None or probability is None:
+        missing = "precipitation" if precipitation is None else "precipitation probability"
+        return GateReading(
+            "precipitation",
+            Verdict.UNKNOWN,
+            f"{missing} data unavailable",
+            unit="mm/%",
+        )
     elif probability > _PRECIP_PROBABILITY_MARGINAL_PCT:
         band = Verdict.MARGINAL
     else:
@@ -157,7 +152,7 @@ def _precipitation_gate(hour: DroneFlightHour) -> GateReading:
 def _temperature_gate(profile: DroneProfile, hour: DroneFlightHour) -> GateReading:
     temperature = hour.temperature_c
     if temperature is None:
-        return GateReading("temperature", Verdict.GOOD, unit="C")
+        return GateReading("temperature", Verdict.UNKNOWN, "temperature data unavailable", unit="C")
     if temperature < profile.min_temp_c or temperature > profile.max_temp_c:
         bound = profile.min_temp_c if temperature < profile.min_temp_c else profile.max_temp_c
         reason = (
@@ -171,7 +166,14 @@ def _temperature_gate(profile: DroneProfile, hour: DroneFlightHour) -> GateReadi
     # Guard on None explicitly: an apparent temperature of exactly 0.0 C is a real,
     # freezing value, and `or` would wrongly discard it as falsy.
     apparent = hour.apparent_temperature_c
-    feels_like = min(temperature, apparent if apparent is not None else temperature)
+    if apparent is None:
+        return GateReading(
+            "apparent_temperature",
+            Verdict.UNKNOWN,
+            "apparent-temperature data unavailable",
+            unit="C",
+        )
+    feels_like = min(temperature, apparent)
     if feels_like < _COLD_CAUTION_C:
         reason = f"cold (feels like {feels_like:.0f} C) reduces battery capacity"
         return GateReading(
@@ -187,7 +189,15 @@ def _temperature_gate(profile: DroneProfile, hour: DroneFlightHour) -> GateReadi
 
 def _icing_gate(hour: DroneFlightHour) -> GateReading:
     freezing_level = hour.freezing_level_agl_m
-    if freezing_level is not None and freezing_level <= _ICING_CEILING_M:
+    if freezing_level is None:
+        return GateReading(
+            "freezing_level_agl",
+            Verdict.UNKNOWN,
+            "freezing-level data unavailable",
+            unit="m",
+            threshold=_ICING_CEILING_M,
+        )
+    if freezing_level <= _ICING_CEILING_M:
         reason = (
             f"icing risk (freezing level ~{freezing_level:.0f} m AGL, "
             f"at or below the {_ICING_CEILING_M:.0f} m ceiling)"
@@ -209,24 +219,27 @@ def _icing_gate(hour: DroneFlightHour) -> GateReading:
     )
 
 
-def _visibility_threshold(profile: DroneProfile) -> float:
-    """Visibility (m) below which the hour is marginal, adapted to the drone's sensing."""
-    threshold = _VISIBILITY_MARGINAL_M
-    if not profile.has_omni_sensing:
-        threshold += _NO_OMNI_VISIBILITY_PENALTY_M
-    if profile.low_light_capable:
-        threshold -= _LOW_LIGHT_VISIBILITY_BONUS_M
-    return threshold
-
-
-def _daylight_visibility_gate(profile: DroneProfile, hour: DroneFlightHour) -> GateReading:
+def _daylight_visibility_gate(hour: DroneFlightHour) -> GateReading:
     if hour.is_day is False:
         return GateReading(
-            "daylight", Verdict.NO_FLY, "night-time (outside daylight visual line of sight)"
+            "daylight",
+            Verdict.NO_FLY,
+            "night-time (application policy: recommendations are daylight-only; UK night "
+            "flight also requires VLOS and a green flashing light)",
         )
-    threshold = _visibility_threshold(profile)
+    if hour.is_day is None:
+        return GateReading("daylight", Verdict.UNKNOWN, "daylight data unavailable")
+    threshold = _VISIBILITY_MARGINAL_M
     visibility = hour.visibility_m
-    if visibility is not None and visibility < threshold:
+    if visibility is None:
+        return GateReading(
+            "visibility",
+            Verdict.UNKNOWN,
+            "visibility data unavailable",
+            unit="m",
+            threshold=threshold,
+        )
+    if visibility < threshold:
         reason = (
             f"reduced visibility ({visibility / 1000:.0f} km, "
             f"below the {threshold / 1000:.0f} km threshold)"
@@ -239,7 +252,15 @@ def _daylight_visibility_gate(profile: DroneProfile, hour: DroneFlightHour) -> G
 
 def _storm_gate(hour: DroneFlightHour) -> GateReading:
     cape = hour.cape
-    if cape is not None and cape >= _CAPE_MARGINAL:
+    if cape is None:
+        return GateReading(
+            "cape",
+            Verdict.UNKNOWN,
+            "CAPE data unavailable",
+            unit="J/kg",
+            threshold=_CAPE_MARGINAL,
+        )
+    if cape >= _CAPE_MARGINAL:
         reason = (
             f"thunderstorm potential (CAPE {cape:.0f} J/kg, "
             f"{cape / _CAPE_MARGINAL:.1f}x the {_CAPE_MARGINAL:.0f} threshold)"
@@ -252,7 +273,15 @@ def _storm_gate(hour: DroneFlightHour) -> GateReading:
 
 def _cloud_gate(hour: DroneFlightHour) -> GateReading:
     low_cloud = hour.cloud_cover_low_pct
-    if low_cloud is not None and low_cloud >= _LOW_CLOUD_MARGINAL_PCT:
+    if low_cloud is None:
+        return GateReading(
+            "low_cloud",
+            Verdict.UNKNOWN,
+            "low-cloud data unavailable",
+            unit="%",
+            threshold=_LOW_CLOUD_MARGINAL_PCT,
+        )
+    if low_cloud >= _LOW_CLOUD_MARGINAL_PCT:
         reason = f"near-overcast low cloud ({low_cloud:.0f}%); check the cloud base stays clear"
         return GateReading(
             "low_cloud",
@@ -267,8 +296,8 @@ def _cloud_gate(hour: DroneFlightHour) -> GateReading:
     )
 
 
-def _geomagnetic_gate(kp_index: float | None) -> GateReading:
-    if kp_index is not None and kp_index >= _KP_CAUTION:
+def _geomagnetic_gate(kp_index: float) -> GateReading:
+    if kp_index >= _KP_CAUTION:
         reason = f"geomagnetic storm (Kp {kp_index:.0f}; GPS/compass risk)"
         return GateReading("kp", Verdict.MARGINAL, reason, value=kp_index, threshold=_KP_CAUTION)
     return GateReading("kp", Verdict.GOOD, value=kp_index, threshold=_KP_CAUTION)
@@ -277,9 +306,22 @@ def _geomagnetic_gate(kp_index: float | None) -> GateReading:
 def _worst_verdict(severity: int) -> Verdict:
     if severity >= _SEVERITY[Verdict.NO_FLY]:
         return Verdict.NO_FLY
+    if severity >= _SEVERITY[Verdict.UNKNOWN]:
+        return Verdict.UNKNOWN
     if severity >= _SEVERITY[Verdict.MARGINAL]:
         return Verdict.MARGINAL
     return Verdict.GOOD
+
+
+def _completeness_gate(hour: DroneFlightHour) -> GateReading | None:
+    if not hour.unavailable_metrics:
+        return None
+    names = ", ".join(hour.unavailable_metrics)
+    return GateReading(
+        "forecast_completeness",
+        Verdict.UNKNOWN,
+        f"required forecast data unavailable: {names}",
+    )
 
 
 def assess_hour(
@@ -298,16 +340,20 @@ def assess_hour(
         The hour's verdict and the limiting factors that produced it.
     """
     governing = _governing_wind_ms(hour)
-    gates = (
+    gates = [
         _wind_gate(profile, governing),
         _precipitation_gate(hour),
         _temperature_gate(profile, hour),
         _icing_gate(hour),
-        _daylight_visibility_gate(profile, hour),
+        _daylight_visibility_gate(hour),
         _storm_gate(hour),
         _cloud_gate(hour),
-        _geomagnetic_gate(kp_index),
-    )
+    ]
+    completeness = _completeness_gate(hour)
+    if completeness is not None:
+        gates.append(completeness)
+    if kp_index is not None:
+        gates.append(_geomagnetic_gate(kp_index))
     worst = max(_SEVERITY[gate.band] for gate in gates)
     # A gate is "limiting" when it set (tied for) the worst non-good verdict.
     readings = tuple(
@@ -340,7 +386,10 @@ def best_window(hours: tuple[HourAssessment, ...]) -> FlightWindow | None:
         if assessment.verdict is not Verdict.GOOD:
             run_start = None
             continue
-        if run_start is None:
+        if (
+            run_start is None
+            or assessment.time.astimezone(UTC) - hours[index - 1].time.astimezone(UTC) != _ONE_HOUR
+        ):
             run_start = index
         length = index - run_start + 1
         if best is None or length > best.hours:
@@ -358,9 +407,9 @@ def daily_outlooks(hours: tuple[HourAssessment, ...]) -> tuple[DayOutlook, ...]:
         One :class:`DayOutlook` per day present, in chronological order, each with
         that day's good-hour count and best contiguous good window.
     """
-    by_date: dict[str, list[HourAssessment]] = {}
+    by_date: dict[date, list[HourAssessment]] = {}
     for hour in hours:
-        by_date.setdefault(hour.time[:10], []).append(hour)
+        by_date.setdefault(hour.time.date(), []).append(hour)
     return tuple(
         DayOutlook(
             date=date,
@@ -375,7 +424,7 @@ def assess_forecast(
     profile: DroneProfile,
     forecast: DroneForecast,
     place_label: str,
-    kp_by_time: Mapping[str, float] | None = None,
+    kp_by_time: Mapping[datetime, float] | None = None,
     now: datetime | None = None,
 ) -> DroneAssessment:
     """Assess every hour of a drone forecast and find the best window.
@@ -384,9 +433,9 @@ def assess_forecast(
         profile: The drone's flight limits.
         forecast: The parsed drone forecast.
         place_label: Human-readable location for the assessment.
-        kp_by_time: Per-hour planetary Kp keyed by the hour's timestamp (so a Kp
+        kp_by_time: Per-hour planetary Kp keyed by the hour's aware timestamp (so a Kp
             forecast varies across the window), or ``None`` when unknown.
-        now: Current naive local time used to drop already-elapsed hours; when
+        now: Current aware instant used to drop already-elapsed hours; when
             ``None`` every forecast hour is assessed.
 
     Returns:
@@ -403,5 +452,6 @@ def assess_forecast(
         place_label=place_label,
         hours=hours,
         best_window=best_window(hours),
+        time_context=forecast.time_context,
         daily=daily_outlooks(hours),
     )

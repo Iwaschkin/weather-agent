@@ -1,93 +1,135 @@
-"""Tests for the NOAA planetary K-index parser and client method."""
+"""Tests for the NOAA planetary Kp provider boundary."""
+
+from datetime import UTC, datetime
 
 import httpx
 import pytest
 
-from weather_agent.client import OpenMeteoClient
-from weather_agent.parsing import SpaceWeatherError, parse_kp, parse_kp_forecast
+from weather_agent.models import KpRowKind
+from weather_agent.space_weather import (
+    SpaceWeatherClient,
+    SpaceWeatherError,
+    parse_kp,
+    parse_kp_forecast,
+)
 
-_KP_BODY: list[object] = [
-    ["time_tag", "Kp", "Kp_fraction", "a_running", "station_count"],
-    ["2026-06-16 03:00:00", "2", "2.00", "7", "8"],
-    ["2026-06-16 06:00:00", "5", "5.33", "48", "8"],
+_CURRENT_BODY: list[object] = [
+    {"time_tag": "2026-07-11T15:00:00", "Kp": 1.33, "station_count": 8},
+    {"time_tag": "2026-07-11T18:00:00", "Kp": 2.33, "station_count": 8},
+]
+_FORECAST_BODY: list[object] = [
+    {
+        "time_tag": "2026-07-11T18:00:00",
+        "kp": 2.33,
+        "observed": "observed",
+        "noaa_scale": None,
+    },
+    {
+        "time_tag": "2026-07-11T21:00:00",
+        "kp": 2.0,
+        "observed": "estimated",
+        "noaa_scale": None,
+    },
+    {
+        "time_tag": "2026-07-12T00:00:00",
+        "kp": 5.0,
+        "observed": "predicted",
+        "noaa_scale": "G1",
+    },
 ]
 
 
-def test_parse_kp_returns_latest_reading() -> None:
-    """The parser returns the last (most recent) row's Kp value."""
-    kp = parse_kp(_KP_BODY)
+def test_parse_kp_returns_latest_object_row() -> None:
+    """The current official object schema produces the newest typed reading."""
+    reading = parse_kp(_CURRENT_BODY)
 
-    assert kp.time == "2026-06-16 06:00:00"
-    assert kp.kp == 5.0
+    assert reading.time == datetime(2026, 7, 11, 18, tzinfo=UTC)
+    assert reading.kp == 2.33
+
+
+def test_parse_kp_forecast_preserves_row_kind_and_scale() -> None:
+    """Observed, estimated, and predicted classifications survive parsing."""
+    entries = parse_kp_forecast(_FORECAST_BODY)
+
+    assert tuple(entry.kind for entry in entries) == (
+        KpRowKind.OBSERVED,
+        KpRowKind.ESTIMATED,
+        KpRowKind.PREDICTED,
+    )
+    assert entries[-1].time == datetime(2026, 7, 12, tzinfo=UTC)
+    assert entries[-1].noaa_scale == "G1"
 
 
 @pytest.mark.parametrize(
     "payload",
     [
-        "not-a-list",
+        "not-an-array",
+        [],
         [["time_tag", "Kp"]],
-        [["time_tag", "Kp"], ["2026-06-16 06:00:00"]],
-        [["time_tag", "Kp"], ["2026-06-16 06:00:00", "stormy"]],
+        [{"time_tag": "2026-07-11T18:00:00", "Kp": "2.33"}],
+        [{"time_tag": "not-a-time", "Kp": 2.33}],
+        [{"time_tag": "2026-07-11T18:00:00", "Kp": float("nan")}],
+        [{"time_tag": "2026-07-11T18:00:00", "Kp": 10.0}],
     ],
 )
-def test_parse_kp_rejects_malformed(payload: object) -> None:
-    """Malformed Kp payloads raise a space-weather error."""
+def test_parse_kp_rejects_malformed_current_rows(payload: object) -> None:
+    """The old shape and invalid values cannot enter the typed boundary."""
     with pytest.raises(SpaceWeatherError):
         _ = parse_kp(payload)
 
 
-_KP_FORECAST_BODY: list[object] = [
-    ["time_tag", "kp", "observed", "noaa_scale"],
-    ["2026-06-16 00:00:00", "3.00", "observed", None],
-    ["2026-06-16 03:00:00", "4.67", "predicted", None],
-    ["2026-06-16 06:00:00", "6.00", "predicted", None],
-]
-
-
-def test_parse_kp_forecast_returns_buckets() -> None:
-    """The forecast parser yields one entry per predicted bucket, in order."""
-    entries = parse_kp_forecast(_KP_FORECAST_BODY)
-
-    assert len(entries) == 3
-    assert entries[0].time == "2026-06-16 00:00:00"
-    assert entries[-1].kp == 6.0
-
-
-def test_parse_kp_forecast_empty_is_empty_tuple() -> None:
-    """A header-only forecast payload yields no entries (best-effort, no raise)."""
-    assert parse_kp_forecast([["time_tag", "kp"]]) == ()
-
-
-def test_parse_kp_forecast_rejects_non_list() -> None:
-    """A non-list forecast payload raises a space-weather error."""
+@pytest.mark.parametrize(
+    "payload",
+    [
+        [],
+        [{"time_tag": "2026-07-12T00:00:00", "kp": 2.0, "observed": "guessed"}],
+        [{"time_tag": "2026-07-12T00:00:00", "kp": 2.0, "observed": "predicted"}],
+        [
+            {
+                "time_tag": "2026-07-12T03:00:00",
+                "kp": 2.0,
+                "observed": "predicted",
+                "noaa_scale": None,
+            },
+            {
+                "time_tag": "2026-07-12T00:00:00",
+                "kp": 2.0,
+                "observed": "predicted",
+                "noaa_scale": None,
+            },
+        ],
+    ],
+)
+def test_parse_kp_forecast_rejects_malformed_rows(payload: object) -> None:
+    """Forecast rows require the current fields and chronological ordering."""
     with pytest.raises(SpaceWeatherError):
-        _ = parse_kp_forecast("not-a-list")
+        _ = parse_kp_forecast(payload)
 
 
-def test_geomagnetic_kp_forecast_targets_noaa() -> None:
-    """geomagnetic_kp_forecast() calls the NOAA forecast product and parses it."""
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        assert request.url.host == "services.swpc.noaa.gov"
-        assert "forecast" in request.url.path
-        return httpx.Response(200, json=_KP_FORECAST_BODY)
-
-    client = OpenMeteoClient(client=httpx.Client(transport=httpx.MockTransport(handler)))
-
-    entries = client.geomagnetic_kp_forecast()
-
-    assert entries[-1].kp == 6.0
-
-
-def test_geomagnetic_kp_targets_noaa() -> None:
-    """geomagnetic_kp() calls the NOAA SWPC host and parses the latest value."""
+def test_space_weather_client_targets_both_noaa_products() -> None:
+    """The provider client owns both NOAA URLs and selects the matching parser."""
+    paths: list[str] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
-        assert request.url.host == "services.swpc.noaa.gov"
-        return httpx.Response(200, json=_KP_BODY)
+        paths.append(request.url.path)
+        body = _FORECAST_BODY if "forecast" in request.url.path else _CURRENT_BODY
+        return httpx.Response(200, json=body)
 
-    client = OpenMeteoClient(client=httpx.Client(transport=httpx.MockTransport(handler)))
+    client = SpaceWeatherClient(client=httpx.Client(transport=httpx.MockTransport(handler)))
 
-    kp = client.geomagnetic_kp()
+    assert client.current_kp().kp == 2.33
+    assert client.kp_forecast()[-1].kind is KpRowKind.PREDICTED
+    assert len(paths) == 2
+    assert all("noaa-planetary-k-index" in path for path in paths)
 
-    assert kp.kp == 5.0
+
+def test_space_weather_client_normalizes_invalid_json() -> None:
+    """A successful HTTP response with invalid JSON is a typed NOAA failure."""
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, text="not JSON")
+
+    client = SpaceWeatherClient(client=httpx.Client(transport=httpx.MockTransport(handler)))
+
+    with pytest.raises(SpaceWeatherError, match="valid JSON"):
+        _ = client.current_kp()

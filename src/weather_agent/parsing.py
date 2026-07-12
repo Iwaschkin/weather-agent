@@ -5,11 +5,16 @@ explicitly, so the rest of the codebase never handles loosely typed payloads. Th
 perform no I/O and are safe to unit test without network access.
 """
 
+import math
+from datetime import UTC, date, datetime
+from itertools import pairwise
 from typing import cast
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from weather_agent.models import (
     Airspace,
     CloudLayer,
+    Coordinates,
     CurrentReadings,
     CurrentWeather,
     DayAlmanac,
@@ -17,15 +22,15 @@ from weather_agent.models import (
     DroneForecast,
     Elevation,
     GeocodeResult,
-    KpForecastEntry,
-    KpIndex,
     MetarReport,
+    TimeContext,
     TimeSeries,
     UvIndex,
 )
 
 # Non-variable keys open-meteo includes in a ``current`` block.
 _CURRENT_META_KEYS = frozenset({"time", "interval"})
+_MAX_UTC_OFFSET_SECONDS = 18 * 60 * 60
 
 
 class ExternalDataError(RuntimeError):
@@ -46,18 +51,6 @@ class OpenMeteoError(ExternalDataError):
             context: Short description of the field or block that was invalid.
         """
         super().__init__(f"Malformed open-meteo payload: {context}")
-
-
-class SpaceWeatherError(ExternalDataError):
-    """Raised when a NOAA SWPC payload is missing or has an unexpected shape."""
-
-    def __init__(self, context: str) -> None:
-        """Build an error naming the payload location that failed validation.
-
-        Args:
-            context: Short description of the field or row that was invalid.
-        """
-        super().__init__(f"Malformed space-weather payload: {context}")
 
 
 class AviationError(ExternalDataError):
@@ -110,7 +103,17 @@ def _require_float(mapping: dict[str, object], key: str) -> float:
     value = mapping.get(key)
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise OpenMeteoError(key)
-    return float(value)
+    result = float(value)
+    if not math.isfinite(result):
+        raise OpenMeteoError(key)
+    return result
+
+
+def _require_int(mapping: dict[str, object], key: str) -> int:
+    value = mapping.get(key)
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise OpenMeteoError(key)
+    return value
 
 
 def _coerce_float_or_none(value: object, context: str) -> float | None:
@@ -119,7 +122,10 @@ def _coerce_float_or_none(value: object, context: str) -> float | None:
         return None
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise OpenMeteoError(context)
-    return float(value)
+    result = float(value)
+    if not math.isfinite(result):
+        raise OpenMeteoError(context)
+    return result
 
 
 def _optional_str(mapping: dict[str, object], key: str) -> str:
@@ -140,15 +146,66 @@ def _optional_int(mapping: dict[str, object], key: str) -> int | None:
 
 def _parse_geocode_entry(entry: object) -> GeocodeResult:
     mapping = _require_mapping(entry, "geocoding result entry")
+    timezone = _require_str(mapping, "timezone")
+    try:
+        _ = ZoneInfo(timezone)
+    except ZoneInfoNotFoundError as error:
+        message = f"unknown geocoding timezone '{timezone}'"
+        raise OpenMeteoError(message) from error
+    try:
+        coordinates = Coordinates(
+            _require_float(mapping, "latitude"),
+            _require_float(mapping, "longitude"),
+        )
+    except ValueError as error:
+        raise OpenMeteoError(str(error)) from error
     return GeocodeResult(
         name=_require_str(mapping, "name"),
         country=_optional_str(mapping, "country"),
         country_code=_optional_str(mapping, "country_code"),
         admin1=_optional_str(mapping, "admin1"),
         population=_optional_int(mapping, "population"),
-        latitude=_require_float(mapping, "latitude"),
-        longitude=_require_float(mapping, "longitude"),
+        coordinates=coordinates,
+        timezone=timezone,
     )
+
+
+def _parse_time_context(body: dict[str, object]) -> TimeContext:
+    timezone = _require_str(body, "timezone")
+    abbreviation = _require_str(body, "timezone_abbreviation")
+    offset = _require_int(body, "utc_offset_seconds")
+    if not abbreviation.strip():
+        message = "timezone_abbreviation must not be empty"
+        raise OpenMeteoError(message)
+    if abs(offset) > _MAX_UTC_OFFSET_SECONDS:
+        message = "utc_offset_seconds is outside the supported range"
+        raise OpenMeteoError(message)
+    try:
+        _ = ZoneInfo(timezone)
+    except ZoneInfoNotFoundError as error:
+        message = f"unknown timezone '{timezone}'"
+        raise OpenMeteoError(message) from error
+    return TimeContext(timezone, abbreviation, offset)
+
+
+def _epoch_datetime(value: object, context: TimeContext, label: str) -> datetime:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise OpenMeteoError(label)
+    try:
+        return datetime.fromtimestamp(value, UTC).astimezone(ZoneInfo(context.timezone))
+    except (OverflowError, OSError, ValueError) as error:
+        message = f"{label} is outside the supported datetime range"
+        raise OpenMeteoError(message) from error
+
+
+def _epoch_date(value: object, context: TimeContext, label: str) -> date:
+    return _epoch_datetime(value, context, label).date()
+
+
+def _time_sort_value(value: date | datetime) -> float:
+    if isinstance(value, datetime):
+        return value.timestamp()
+    return float(value.toordinal())
 
 
 def parse_geocode_results(payload: object) -> list[GeocodeResult]:
@@ -187,9 +244,11 @@ def parse_current_weather(payload: object) -> CurrentWeather:
             an unexpected shape.
     """
     body = _require_mapping(payload, "forecast response")
+    time_context = _parse_time_context(body)
     current = _require_mapping(body.get("current"), "current weather block")
     return CurrentWeather(
-        time=_require_str(current, "time"),
+        time=_epoch_datetime(current.get("time"), time_context, "current weather time"),
+        time_context=time_context,
         temperature_celsius=_require_float(current, "temperature_2m"),
         wind_speed_kmh=_require_float(current, "wind_speed_10m"),
         weather_code=_coerce_float_or_none(current.get("weather_code"), "weather_code"),
@@ -218,34 +277,32 @@ def parse_uv_index(payload: object) -> UvIndex:
 
     Raises:
         OpenMeteoError: If the payload or its ``current`` block is missing or has
-            an unexpected shape, or the current ``time`` is absent or non-string.
+            an unexpected shape, or the current time is not a valid Unix instant.
     """
     body = _require_mapping(payload, "uv response")
+    time_context = _parse_time_context(body)
     current = _require_mapping(body.get("current"), "current uv block")
     daily = parse_time_series(payload, "daily")
     maxima = daily.series.get("uv_index_max", ())
     return UvIndex(
-        time=_require_str(current, "time"),
+        time=_epoch_datetime(current.get("time"), time_context, "current uv time"),
         current=_coerce_float_or_none(current.get("uv_index"), "uv_index"),
         today_max=maxima[0] if maxima else None,
+        time_context=time_context,
     )
 
 
-def _string_at(items: list[object], index: int) -> str:
-    if index < len(items):
-        value = items[index]
-        if isinstance(value, str):
-            return value
-    return ""
-
-
-def _string_column(raw: object, count: int) -> list[str]:
-    # Sun times are ISO strings, not floats, so they bypass the numeric series.
-    # A missing or short column degrades to empty strings rather than raising.
-    if not isinstance(raw, list):
-        return [""] * count
-    items = cast("list[object]", raw)
-    return [_string_at(items, index) for index in range(count)]
+def _datetime_column(
+    raw: object,
+    count: int,
+    context: TimeContext,
+    label: str,
+) -> list[datetime | None]:
+    values = _require_list(raw, label)
+    if len(values) != count:
+        message = f"{label} length mismatch"
+        raise OpenMeteoError(message)
+    return [None if value is None else _epoch_datetime(value, context, label) for value in values]
 
 
 def _optional_float_column(raw: object, count: int) -> list[float | None]:
@@ -261,8 +318,9 @@ def _optional_float_column(raw: object, count: int) -> list[float | None]:
 def parse_daily_almanac(payload: object) -> tuple[DayAlmanac, ...]:
     """Parse a daily sun-times payload (sunrise/sunset/daylight) into almanac rows.
 
-    Sunrise and sunset arrive as ISO strings, so they bypass the numeric
-    :class:`TimeSeries` and are read directly here.
+    Dates and sun times arrive as Unix instants. They bypass the numeric
+    :class:`TimeSeries` because the sun-time columns are nullable datetimes rather
+    than weather measurements.
 
     Args:
         payload: Decoded JSON from the forecast endpoint requested with
@@ -276,11 +334,12 @@ def parse_daily_almanac(payload: object) -> tuple[DayAlmanac, ...]:
             is missing or has an unexpected shape.
     """
     body = _require_mapping(payload, "almanac response")
+    time_context = _parse_time_context(body)
     block = _require_mapping(body.get("daily"), "daily block")
     raw_dates = _require_list(block.get("time"), "daily time array")
-    dates = [_require_str_value(value, "daily date") for value in raw_dates]
-    sunrises = _string_column(block.get("sunrise"), len(dates))
-    sunsets = _string_column(block.get("sunset"), len(dates))
+    dates = [_epoch_date(value, time_context, "daily date") for value in raw_dates]
+    sunrises = _datetime_column(block.get("sunrise"), len(dates), time_context, "sunrise")
+    sunsets = _datetime_column(block.get("sunset"), len(dates), time_context, "sunset")
     daylight = _optional_float_column(block.get("daylight_duration"), len(dates))
     return tuple(
         DayAlmanac(
@@ -288,6 +347,7 @@ def parse_daily_almanac(payload: object) -> tuple[DayAlmanac, ...]:
             sunrise=sunrises[index],
             sunset=sunsets[index],
             daylight_seconds=daylight[index],
+            time_context=time_context,
         )
         for index in range(len(dates))
     )
@@ -311,17 +371,18 @@ def parse_current_readings(payload: object) -> CurrentReadings:
 
     Raises:
         OpenMeteoError: If the payload or its ``current`` block is missing or has
-            an unexpected shape, or the ``time`` field is absent or non-string.
+            an unexpected shape, or the time is not a valid Unix instant.
     """
     body = _require_mapping(payload, "current response")
+    time_context = _parse_time_context(body)
     current = _require_mapping(body.get("current"), "current block")
-    time = _require_str(current, "time")
+    time = _epoch_datetime(current.get("time"), time_context, "current time")
     values = {
         key: _coerce_float_or_none(value, key)
         for key, value in current.items()
         if key not in _CURRENT_META_KEYS
     }
-    return CurrentReadings(time=time, values=values)
+    return CurrentReadings(time=time, values=values, time_context=time_context)
 
 
 def _parse_column(raw: object, row_count: int, variable: str) -> tuple[float | None, ...]:
@@ -353,21 +414,21 @@ def parse_time_series(payload: object, block: str) -> TimeSeries:
             column whose length does not match ``time``).
     """
     body = _require_mapping(payload, f"{block} response")
+    time_context = _parse_time_context(body)
     block_body = _require_mapping(body.get(block), f"{block} block")
     raw_time = _require_list(block_body.get("time"), f"{block} time array")
-    timestamps = tuple(_require_str_value(value, f"{block} timestamp") for value in raw_time)
+    parse_time = _epoch_date if block == "daily" else _epoch_datetime
+    timestamps = tuple(parse_time(value, time_context, f"{block} timestamp") for value in raw_time)
+    order = tuple(_time_sort_value(value) for value in timestamps)
+    if any(current <= previous for previous, current in pairwise(order)):
+        message = f"{block} timestamps must be strictly chronological"
+        raise OpenMeteoError(message)
     series = {
         variable: _parse_column(raw_column, len(timestamps), variable)
         for variable, raw_column in block_body.items()
         if variable != "time"
     }
-    return TimeSeries(timestamps=timestamps, series=series)
-
-
-def _require_str_value(value: object, context: str) -> str:
-    if not isinstance(value, str):
-        raise OpenMeteoError(context)
-    return value
+    return TimeSeries(timestamps=timestamps, series=series, time_context=time_context)
 
 
 def parse_elevation(payload: object) -> Elevation:
@@ -436,10 +497,86 @@ DRONE_HOURLY_VARIABLES = (
 DRONE_HOURLY_REQUEST = ",".join(DRONE_HOURLY_VARIABLES)
 # Comma-joined form of DRONE_HOURLY_VARIABLES for the query string.
 
+_DRONE_PERCENT_VARIABLES = frozenset({"precipitation_probability", "cloud_cover_low"})
+_MAX_PERCENT = 100.0
+_DRONE_NONNEGATIVE_VARIABLES = frozenset(
+    {
+        "wind_gusts_10m",
+        "wind_speed_10m",
+        "wind_speed_80m",
+        "wind_speed_120m",
+        "wind_speed_180m",
+        "precipitation",
+        "visibility",
+        "cape",
+        "wind_speed_950hPa",
+        "wind_speed_925hPa",
+        "wind_speed_900hPa",
+    }
+)
+
 
 def _cell(series: TimeSeries, variable: str, index: int) -> float | None:
     column = series.series.get(variable)
     return column[index] if column is not None else None
+
+
+def _require_drone_columns(series: TimeSeries) -> None:
+    missing = [variable for variable in DRONE_HOURLY_VARIABLES if variable not in series.series]
+    if missing:
+        message = f"drone hourly columns missing: {', '.join(missing)}"
+        raise OpenMeteoError(message)
+
+
+def _validate_drone_timestamps(timestamps: tuple[date | datetime, ...]) -> None:
+    if not timestamps:
+        message = "drone hourly timestamps are empty"
+        raise OpenMeteoError(message)
+    for value in timestamps:
+        if not isinstance(value, datetime) or value.tzinfo is None:
+            message = "drone timestamps must be aware instants"
+            raise OpenMeteoError(message)
+
+
+def _validate_drone_value(variable: str, value: float | None) -> None:
+    if value is None:
+        return
+    if variable in _DRONE_PERCENT_VARIABLES and not 0.0 <= value <= _MAX_PERCENT:
+        message = f"value in '{variable}' must be between 0 and 100"
+        raise OpenMeteoError(message)
+    if variable in _DRONE_NONNEGATIVE_VARIABLES and value < 0.0:
+        message = f"value in '{variable}' cannot be negative"
+        raise OpenMeteoError(message)
+    if variable == "is_day" and value not in (0.0, 1.0):
+        message = "value in 'is_day' must be 0 or 1"
+        raise OpenMeteoError(message)
+
+
+def _validate_drone_values(series: TimeSeries) -> None:
+    for variable in DRONE_HOURLY_VARIABLES:
+        for value in series.column(variable):
+            _validate_drone_value(variable, value)
+
+
+def _unavailable_metrics(series: TimeSeries, index: int, elevation_m: float) -> tuple[str, ...]:
+    unavailable = [
+        variable
+        for variable in DRONE_HOURLY_VARIABLES
+        if _cell(series, variable, index) is None
+        and not variable.startswith(("wind_speed_9", "geopotential_height_9"))
+    ]
+    for hpa in _PRESSURE_LEVELS_HPA:
+        wind_name = f"wind_speed_{hpa}hPa"
+        height_name = f"geopotential_height_{hpa}hPa"
+        height = _cell(series, height_name, index)
+        if height is None:
+            unavailable.append(height_name)
+        elif (
+            0.0 <= height - elevation_m <= _MAX_AGL_METRES
+            and _cell(series, wind_name, index) is None
+        ):
+            unavailable.append(wind_name)
+    return tuple(unavailable)
 
 
 def _derive_wind_max_0_500m(series: TimeSeries, index: int, elevation_m: float) -> float | None:
@@ -470,8 +607,12 @@ def _freezing_level_agl(series: TimeSeries, index: int, elevation_m: float) -> f
 
 def _parse_drone_hour(series: TimeSeries, index: int, elevation_m: float) -> DroneFlightHour:
     is_day_value = _cell(series, "is_day", index)
+    time = series.timestamps[index]
+    if not isinstance(time, datetime):
+        message = "drone timestamp must be an instant"
+        raise OpenMeteoError(message)
     return DroneFlightHour(
-        time=series.timestamps[index],
+        time=time,
         temperature_c=_cell(series, "temperature_2m", index),
         apparent_temperature_c=_cell(series, "apparent_temperature", index),
         wind_gust_10m_kmh=_cell(series, "wind_gusts_10m", index),
@@ -481,8 +622,9 @@ def _parse_drone_hour(series: TimeSeries, index: int, elevation_m: float) -> Dro
         visibility_m=_cell(series, "visibility", index),
         cape=_cell(series, "cape", index),
         freezing_level_agl_m=_freezing_level_agl(series, index, elevation_m),
-        is_day=None if is_day_value is None else bool(is_day_value),
+        is_day=None if is_day_value is None else is_day_value == 1.0,
         cloud_cover_low_pct=_cell(series, "cloud_cover_low", index),
+        unavailable_metrics=_unavailable_metrics(series, index, elevation_m),
     )
 
 
@@ -507,96 +649,13 @@ def parse_drone_forecast(payload: object) -> DroneForecast:
     body = _require_mapping(payload, "drone forecast response")
     elevation_m = _require_float(body, "elevation")
     series = parse_time_series(payload, "hourly")
+    _require_drone_columns(series)
+    _validate_drone_timestamps(series.timestamps)
+    _validate_drone_values(series)
     hours = tuple(
         _parse_drone_hour(series, index, elevation_m) for index in range(len(series.timestamps))
     )
-    return DroneForecast(elevation_m=elevation_m, hours=hours)
-
-
-def _coerce_kp_value(value: object) -> float:
-    message = "non-numeric Kp value"
-    if isinstance(value, bool):
-        raise SpaceWeatherError(message)
-    if isinstance(value, (int, float)):
-        return float(value)
-    if isinstance(value, str):
-        try:
-            return float(value)
-        except ValueError as error:
-            raise SpaceWeatherError(message) from error
-    raise SpaceWeatherError(message)
-
-
-def parse_kp(payload: object) -> KpIndex:
-    """Parse a NOAA SWPC planetary K-index payload into the latest reading.
-
-    The endpoint returns a CSV-style array of arrays whose first row is a header
-    (``["time_tag", "Kp", ...]``) and whose remaining rows are observations in
-    chronological order. The most recent row is the last one.
-
-    Args:
-        payload: Decoded JSON from the NOAA planetary K-index product.
-
-    Returns:
-        The latest planetary K-index reading.
-
-    Raises:
-        SpaceWeatherError: If the payload has no data rows or an unexpected shape.
-    """
-    if not isinstance(payload, list):
-        not_list_message = "planetary Kp response"
-        raise SpaceWeatherError(not_list_message)
-    rows = cast("list[object]", payload)
-    data_rows = rows[1:]
-    if not data_rows:
-        empty_message = "empty planetary Kp data"
-        raise SpaceWeatherError(empty_message)
-    last = _require_kp_row(data_rows[-1])
-    time_value = last[0]
-    if not isinstance(time_value, str):
-        time_message = "non-string Kp timestamp"
-        raise SpaceWeatherError(time_message)
-    return KpIndex(time=time_value, kp=_coerce_kp_value(last[1]))
-
-
-_MIN_KP_ROW_FIELDS = 2
-
-
-def _require_kp_row(value: object) -> list[object]:
-    if not isinstance(value, list) or len(cast("list[object]", value)) < _MIN_KP_ROW_FIELDS:
-        message = "malformed planetary Kp row"
-        raise SpaceWeatherError(message)
-    return cast("list[object]", value)
-
-
-def parse_kp_forecast(payload: object) -> tuple[KpForecastEntry, ...]:
-    """Parse the NOAA SWPC 3-day planetary K-index forecast.
-
-    Same array-of-arrays shape as the nowcast: a header row followed by one row
-    per 3-hour bucket (``[time_tag, kp, ...]``) in UTC and chronological order.
-
-    Args:
-        payload: Decoded JSON from the NOAA planetary K-index forecast product.
-
-    Returns:
-        The predicted buckets in chronological order; empty when none are present.
-
-    Raises:
-        SpaceWeatherError: If the payload is not a list or a row is malformed.
-    """
-    if not isinstance(payload, list):
-        not_list_message = "planetary Kp forecast response"
-        raise SpaceWeatherError(not_list_message)
-    rows = cast("list[object]", payload)
-    entries: list[KpForecastEntry] = []
-    for row in rows[1:]:
-        fields = _require_kp_row(row)
-        time_value = fields[0]
-        if not isinstance(time_value, str):
-            time_message = "non-string Kp forecast timestamp"
-            raise SpaceWeatherError(time_message)
-        entries.append(KpForecastEntry(time=time_value, kp=_coerce_kp_value(fields[1])))
-    return tuple(entries)
+    return DroneForecast(elevation_m=elevation_m, hours=hours, time_context=series.time_context)
 
 
 def _lenient_float(value: object) -> float | None:
@@ -646,14 +705,28 @@ def _metar_from(mapping: dict[str, object]) -> MetarReport | None:
     longitude = _lenient_float(mapping.get("lon"))
     if not isinstance(station, str) or latitude is None or longitude is None:
         return None
+    try:
+        coordinates = Coordinates(latitude, longitude)
+    except ValueError as error:
+        raise AviationError(str(error)) from error
     layers = _cloud_layers(mapping.get("clouds"))
     observed = mapping.get("reportTime")
+    if not isinstance(observed, str):
+        message = "METAR reportTime must be an aware ISO-8601 string"
+        raise AviationError(message)
+    try:
+        observed_at = datetime.fromisoformat(observed.replace("Z", "+00:00"))
+    except ValueError as error:
+        message = "METAR reportTime is not ISO-8601"
+        raise AviationError(message) from error
+    if observed_at.tzinfo is None:
+        message = "METAR reportTime must include a timezone"
+        raise AviationError(message)
     raw = mapping.get("rawOb")
     return MetarReport(
         station=station,
-        latitude=latitude,
-        longitude=longitude,
-        observed=observed if isinstance(observed, str) else "",
+        coordinates=coordinates,
+        observed=observed_at.astimezone(UTC),
         wind_dir_deg=_lenient_float(mapping.get("wdir")),
         wind_speed_kt=_lenient_float(mapping.get("wspd")),
         wind_gust_kt=_lenient_float(mapping.get("wgst")),

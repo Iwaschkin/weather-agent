@@ -7,24 +7,27 @@ samples (open-meteo gaps) are rendered as ``"n/a"`` and ignored in aggregates.
 
 from __future__ import annotations
 
+from datetime import datetime
 from typing import TYPE_CHECKING
 
 from weather_agent.bands import UV_SCALE, classify, render_reading
 from weather_agent.weather_codes import describe_weather_code
 
 if TYPE_CHECKING:
+    from datetime import date
+
     from weather_agent.models import (
         Airspace,
         CurrentReadings,
         CurrentWeather,
         DayAlmanac,
         MetarReport,
+        TimeContext,
         TimeSeries,
         UvIndex,
     )
 
 _SECONDS_PER_HOUR = 3600.0
-_HHMM_LENGTH = 5  # length of an "HH:MM" clock string
 _SOLAR_RADIATION_SUM = "shortwave_radiation_sum"
 _SUNSHINE_DURATION = "sunshine_duration"
 _DAYLIGHT_DURATION = "daylight_duration"
@@ -56,6 +59,16 @@ def _mean(values: tuple[float | None, ...]) -> float | None:
 
 def _format_value(value: float | None) -> str:
     return "n/a" if value is None else f"{value:.1f}"
+
+
+def _time_label(value: date | datetime) -> str:
+    if isinstance(value, datetime):
+        return value.strftime("%Y-%m-%d %H:%M %Z")
+    return value.isoformat()
+
+
+def _zone_label(context: TimeContext) -> str:
+    return f"{context.timezone} ({context.abbreviation})"
 
 
 def _cell(series: TimeSeries, variable: str, index: int) -> float | None:
@@ -110,9 +123,13 @@ def describe_daily_forecast(place_label: str, series: TimeSeries, max_days: int)
     if count == 0:
         return f"No forecast data available for {place_label}."
     lines = [
-        f"{series.timestamps[index]}: {_forecast_body(series, index)}" for index in range(count)
+        f"{_time_label(series.timestamps[index])}: {_forecast_body(series, index)}"
+        for index in range(count)
     ]
-    return f"Forecast for {place_label}:\n" + "\n".join(lines)
+    return (
+        f"Forecast for {place_label} (local dates: {_zone_label(series.time_context)}):\n"
+        + "\n".join(lines)
+    )
 
 
 def describe_forecast_day(
@@ -137,7 +154,8 @@ def describe_forecast_day(
     if not 0 <= index < len(series.timestamps):
         return f"No {heading.lower()} data available for {place_label}."
     return (
-        f"{heading} for {place_label} on {series.timestamps[index]}: "
+        f"{heading} for {place_label} on {_time_label(series.timestamps[index])} "
+        f"({_zone_label(series.time_context)}): "
         f"{_forecast_body(series, index)}."
     )
 
@@ -168,7 +186,11 @@ def describe_period(place_label: str, series: TimeSeries, period_label: str) -> 
         parts.append(f"min {min(lows):.1f} °C")
     if precip:
         parts.append(f"total precipitation {sum(precip):.1f} mm")
-    return f"{period_label} for {place_label}: " + ", ".join(parts) + "."
+    return (
+        f"{period_label} for {place_label} (local dates: {_zone_label(series.time_context)}): "
+        + ", ".join(parts)
+        + "."
+    )
 
 
 def describe_latest_values(
@@ -200,7 +222,10 @@ def describe_latest_values(
     readings = ", ".join(
         render_reading(variable, _cell(series, variable, 0)) for variable in variables
     )
-    return f"{label} for {place_label} (as of {series.timestamps[0]}): {readings}."
+    return (
+        f"{label} for {place_label} (as of {_time_label(series.timestamps[0])}; "
+        f"{_zone_label(series.time_context)}): {readings}."
+    )
 
 
 def describe_current_weather(place_label: str, weather: CurrentWeather) -> str:
@@ -229,7 +254,11 @@ def describe_current_weather(place_label: str, weather: CurrentWeather) -> str:
         parts.append(f"cloud {weather.cloud_cover_pct:.0f}%")
     if weather.surface_pressure_hpa is not None:
         parts.append(f"pressure {weather.surface_pressure_hpa:.0f} hPa")
-    return f"Current weather in {place_label}: " + ", ".join(parts) + f" (as of {weather.time})."
+    return (
+        f"Current weather in {place_label}: "
+        + ", ".join(parts)
+        + f" (as of {_time_label(weather.time)}; {_zone_label(weather.time_context)})."
+    )
 
 
 def describe_current_readings(
@@ -253,7 +282,10 @@ def describe_current_readings(
     rendered = ", ".join(
         render_reading(variable, readings.values.get(variable)) for variable in variables
     )
-    return f"{label} for {place_label} (as of {readings.time}): {rendered}."
+    return (
+        f"{label} for {place_label} (as of {_time_label(readings.time)}; "
+        f"{_zone_label(readings.time_context)}): {rendered}."
+    )
 
 
 def describe_ensemble_spread(place_label: str, series: TimeSeries, label: str) -> str:
@@ -275,7 +307,8 @@ def describe_ensemble_spread(place_label: str, series: TimeSeries, label: str) -
         return f"No {label.lower()} member values available for {place_label}."
     mean = sum(members) / len(members)
     return (
-        f"{label} for {place_label} (as of {series.timestamps[0]}): "
+        f"{label} for {place_label} (valid {_time_label(series.timestamps[0])}; "
+        f"{_zone_label(series.time_context)}): "
         f"{len(members)} members, range {min(members):.1f}-{max(members):.1f}, "
         f"mean {mean:.1f}."
     )
@@ -344,7 +377,8 @@ def describe_metar(place_label: str, report: MetarReport) -> str:
         parts.append(f"visibility {report.visibility_sm:.0f} SM")
     parts.append(ceiling)
     body = ", ".join(part for part in parts if part) or "no data"
-    return f"Nearest METAR for {place_label} - {report.station} (as of {report.observed}): {body}."
+    observed = report.observed.strftime("%Y-%m-%d %H:%M UTC")
+    return f"Nearest METAR for {place_label} - {report.station} (as of {observed}): {body}."
 
 
 def describe_airspace(place_label: str, airspaces: tuple[Airspace, ...], note: str = "") -> str:
@@ -418,7 +452,10 @@ def describe_uv(place_label: str, uv: UvIndex) -> str:
         parts.append(f"now {uv.current:.1f} ({classify(UV_SCALE, uv.current)})")
     if uv.today_max is not None:
         parts.append(f"today's max {uv.today_max:.1f} ({classify(UV_SCALE, uv.today_max)})")
-    return f"UV index for {place_label} (as of {uv.time}): " + ", ".join(parts) + "."
+    return (
+        f"UV index for {place_label} (as of {_time_label(uv.time)}; "
+        f"{_zone_label(uv.time_context)}): " + ", ".join(parts) + "."
+    )
 
 
 def describe_solar(place_label: str, series: TimeSeries, max_days: int) -> str:
@@ -437,35 +474,33 @@ def describe_solar(place_label: str, series: TimeSeries, max_days: int) -> str:
         return f"No solar data available for {place_label}."
     lines = [
         (
-            f"{series.timestamps[index]}: "
+            f"{_time_label(series.timestamps[index])}: "
             f"radiation {_format_value(_cell(series, _SOLAR_RADIATION_SUM, index))} MJ/m², "
             f"sunshine {_hours(_cell(series, _SUNSHINE_DURATION, index))}, "
             f"daylight {_hours(_cell(series, _DAYLIGHT_DURATION, index))}"
         )
         for index in range(count)
     ]
-    return f"Solar potential for {place_label}:\n" + "\n".join(lines)
+    return (
+        f"Solar potential for {place_label} (local dates: "
+        f"{_zone_label(series.time_context)}):\n" + "\n".join(lines)
+    )
 
 
 def _hours(seconds: float | None) -> str:
     return "n/a" if seconds is None else f"{seconds / _SECONDS_PER_HOUR:.1f} h"
 
 
-def format_clock(iso_timestamp: str) -> str:
-    """Extract a ``HH:MM`` clock time from an ISO-8601 local timestamp.
+def format_clock(value: datetime | None) -> str:
+    """Format a local aware timestamp as a clock time and abbreviation.
 
     Args:
-        iso_timestamp: An ISO timestamp such as ``"2026-06-17T04:45"`` (or an empty
-            string when the time is unavailable).
+        value: Aware local timestamp, or ``None`` when unavailable.
 
     Returns:
-        The ``HH:MM`` portion, or ``"n/a"`` when the input is empty or has no time
-        component.
+        A ``HH:MM ZZZ`` label, or ``"n/a"`` when unavailable.
     """
-    if "T" not in iso_timestamp:
-        return "n/a"
-    time_part = iso_timestamp.split("T", 1)[1]
-    return time_part[:_HHMM_LENGTH] if len(time_part) >= _HHMM_LENGTH else "n/a"
+    return "n/a" if value is None else value.strftime("%H:%M %Z")
 
 
 def describe_sun_times(place_label: str, almanac: tuple[DayAlmanac, ...]) -> str:
@@ -482,10 +517,12 @@ def describe_sun_times(place_label: str, almanac: tuple[DayAlmanac, ...]) -> str
         return f"No sun-time data available for {place_label}."
     lines = [
         (
-            f"{day.date}: sunrise {format_clock(day.sunrise)}, "
+            f"{day.date.isoformat()}: sunrise {format_clock(day.sunrise)}, "
             f"sunset {format_clock(day.sunset)}, "
             f"daylight {_hours(day.daylight_seconds)}"
         )
         for day in almanac
     ]
-    return f"Sun times for {place_label}:\n" + "\n".join(lines)
+    return f"Sun times for {place_label} ({_zone_label(almanac[0].time_context)}):\n" + "\n".join(
+        lines
+    )

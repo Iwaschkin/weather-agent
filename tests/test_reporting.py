@@ -1,10 +1,14 @@
 """Tests for the pure time-series reporting helpers."""
 
+from datetime import UTC, date, datetime
+
 import pytest
 
+from tests.time_helpers import BERLIN_SUMMER_CONTEXT, LONDON_SUMMER_CONTEXT, aware
 from weather_agent.models import (
     Airspace,
     CloudLayer,
+    Coordinates,
     CurrentReadings,
     CurrentWeather,
     DayAlmanac,
@@ -32,12 +36,13 @@ from weather_agent.reporting import (
 
 def _series() -> TimeSeries:
     return TimeSeries(
-        timestamps=("2026-06-14", "2026-06-15", "2026-06-16"),
+        timestamps=(date(2026, 6, 14), date(2026, 6, 15), date(2026, 6, 16)),
         series={
             "temperature_2m_max": (21.0, 23.5, None),
             "temperature_2m_min": (11.0, 12.5, 13.0),
             "precipitation_sum": (0.0, 4.2, 1.0),
         },
+        time_context=BERLIN_SUMMER_CONTEXT,
     )
 
 
@@ -62,7 +67,7 @@ def test_describe_forecast_day_renders_single_day() -> None:
     """The single-day renderer shows only the requested day."""
     summary = describe_forecast_day("Berlin", _series(), index=1)
 
-    assert "Forecast for Berlin on 2026-06-15:" in summary
+    assert "Forecast for Berlin on 2026-06-15 (Europe/Berlin (CEST)):" in summary
     assert "high 23.5" in summary
     assert "2026-06-14" not in summary
     assert "2026-06-16" not in summary
@@ -75,7 +80,7 @@ def test_describe_forecast_day_out_of_range_is_noted() -> None:
 
 def test_describe_daily_forecast_handles_empty_series() -> None:
     """An empty series yields an explanatory note, not an exception."""
-    empty = TimeSeries(timestamps=(), series={})
+    empty = TimeSeries(timestamps=(), series={}, time_context=BERLIN_SUMMER_CONTEXT)
 
     assert "No forecast data" in describe_daily_forecast("Berlin", empty, max_days=3)
 
@@ -93,7 +98,7 @@ def test_describe_period_aggregates_extremes_and_totals() -> None:
 
 def test_describe_period_handles_empty_series() -> None:
     """An empty series yields an explanatory note."""
-    empty = TimeSeries(timestamps=(), series={})
+    empty = TimeSeries(timestamps=(), series={}, time_context=BERLIN_SUMMER_CONTEXT)
 
     assert "No historical weather data" in describe_period("Berlin", empty, "Historical weather")
 
@@ -101,20 +106,24 @@ def test_describe_period_handles_empty_series() -> None:
 def test_describe_latest_values_reports_first_row() -> None:
     """The latest-values helper reports the first row of named variables."""
     series = TimeSeries(
-        timestamps=("2026-06-15T00:00", "2026-06-15T01:00"),
+        timestamps=(
+            aware("2026-06-15T00:00", "Europe/Berlin"),
+            aware("2026-06-15T01:00", "Europe/Berlin"),
+        ),
         series={"pm2_5": (12.0, 13.0), "pm10": (20.0, None)},
+        time_context=BERLIN_SUMMER_CONTEXT,
     )
 
     summary = describe_latest_values("Berlin", series, "Air quality", ("pm2_5", "pm10"))
 
-    assert "Air quality for Berlin (as of 2026-06-15T00:00)" in summary
+    assert "Air quality for Berlin (as of 2026-06-15 00:00 CEST" in summary
     assert "PM2.5 12.0 µg/m³ (fair)" in summary
     assert "PM10 20.0 µg/m³ (fair)" in summary
 
 
 def test_describe_latest_values_handles_empty_series() -> None:
     """An empty series yields an explanatory note."""
-    empty = TimeSeries(timestamps=(), series={})
+    empty = TimeSeries(timestamps=(), series={}, time_context=BERLIN_SUMMER_CONTEXT)
 
     summary = describe_latest_values("Berlin", empty, "Air quality", ("pm2_5",))
     assert "No air quality data" in summary
@@ -123,15 +132,16 @@ def test_describe_latest_values_handles_empty_series() -> None:
 def test_describe_current_readings_reports_present_hour() -> None:
     """Current readings render the present-hour values with their own timestamp."""
     readings = CurrentReadings(
-        time="2026-06-15T13:00",
+        time=aware("2026-06-15T13:00", "Europe/Berlin"),
         values={"pm2_5": 12.0, "pm10": 20.0, "european_aqi": None},
+        time_context=BERLIN_SUMMER_CONTEXT,
     )
 
     summary = describe_current_readings(
         "Berlin", readings, "Air quality", ("pm2_5", "pm10", "european_aqi")
     )
 
-    assert "Air quality for Berlin (as of 2026-06-15T13:00)" in summary
+    assert "Air quality for Berlin (as of 2026-06-15 13:00 CEST" in summary
     assert "PM2.5 12.0 µg/m³ (fair)" in summary
     assert "European AQI n/a" in summary
 
@@ -139,12 +149,13 @@ def test_describe_current_readings_reports_present_hour() -> None:
 def test_describe_ensemble_spread_reports_range_and_mean() -> None:
     """The ensemble helper aggregates member columns at the first row."""
     series = TimeSeries(
-        timestamps=("2026-06-15T00:00",),
+        timestamps=(aware("2026-06-15T13:00", "Europe/Berlin"),),
         series={
             "temperature_2m_member01": (10.0,),
             "temperature_2m_member02": (14.0,),
             "temperature_2m_member03": (12.0,),
         },
+        time_context=BERLIN_SUMMER_CONTEXT,
     )
 
     summary = describe_ensemble_spread("Berlin", series, "Ensemble temperature")
@@ -156,7 +167,7 @@ def test_describe_ensemble_spread_reports_range_and_mean() -> None:
 
 def test_describe_ensemble_spread_handles_empty_series() -> None:
     """An empty series yields an explanatory note."""
-    empty = TimeSeries(timestamps=(), series={})
+    empty = TimeSeries(timestamps=(), series={}, time_context=BERLIN_SUMMER_CONTEXT)
 
     summary = describe_ensemble_spread("Berlin", empty, "Ensemble temperature")
     assert "No ensemble temperature data" in summary
@@ -164,8 +175,16 @@ def test_describe_ensemble_spread_handles_empty_series() -> None:
 
 def test_describe_comparison_reports_delta() -> None:
     """The comparison helper reports both periods and the temperature delta."""
-    warm = TimeSeries(timestamps=("2026-07-01",), series={"temperature_2m_max": (30.0,)})
-    cool = TimeSeries(timestamps=("2026-01-01",), series={"temperature_2m_max": (5.0,)})
+    warm = TimeSeries(
+        timestamps=(date(2026, 7, 1),),
+        series={"temperature_2m_max": (30.0,)},
+        time_context=BERLIN_SUMMER_CONTEXT,
+    )
+    cool = TimeSeries(
+        timestamps=(date(2026, 1, 1),),
+        series={"temperature_2m_max": (5.0,)},
+        time_context=BERLIN_SUMMER_CONTEXT,
+    )
 
     summary = describe_comparison("Berlin", "summer", warm, "winter", cool)
 
@@ -176,7 +195,8 @@ def test_describe_comparison_reports_delta() -> None:
 def test_describe_current_weather_names_condition_and_extras() -> None:
     """Current weather names the WMO condition and appends present optional fields."""
     weather = CurrentWeather(
-        time="2026-06-15T12:00",
+        time=aware("2026-06-15T12:00", "Europe/Berlin"),
+        time_context=BERLIN_SUMMER_CONTEXT,
         temperature_celsius=21.3,
         wind_speed_kmh=9.7,
         weather_code=61.0,
@@ -196,7 +216,8 @@ def test_describe_current_weather_names_condition_and_extras() -> None:
 def test_describe_current_weather_omits_absent_optionals() -> None:
     """Optional fields that are None are left out of the line."""
     weather = CurrentWeather(
-        time="2026-06-15T12:00",
+        time=aware("2026-06-15T12:00", "Europe/Berlin"),
+        time_context=BERLIN_SUMMER_CONTEXT,
         temperature_celsius=21.3,
         wind_speed_kmh=9.7,
         weather_code=None,
@@ -218,40 +239,50 @@ def test_describe_current_weather_omits_absent_optionals() -> None:
 )
 def test_describe_uv_bands(value: float, band: str) -> None:
     """The UV index maps to the right WHO risk band."""
-    uv = UvIndex(time="2026-06-15T12:00", current=value, today_max=value)
+    uv = UvIndex(
+        time=aware("2026-06-15T12:00", "Europe/Berlin"),
+        current=value,
+        today_max=value,
+        time_context=BERLIN_SUMMER_CONTEXT,
+    )
 
     assert band in describe_uv("Nairobi", uv)
 
 
 def test_describe_uv_handles_no_data() -> None:
     """All-None UV yields an explanatory note."""
-    uv = UvIndex(time="t", current=None, today_max=None)
+    uv = UvIndex(
+        time=aware("2026-06-15T12:00", "Europe/Berlin"),
+        current=None,
+        today_max=None,
+        time_context=BERLIN_SUMMER_CONTEXT,
+    )
 
     assert "No UV data" in describe_uv("Nairobi", uv)
 
 
 @pytest.mark.parametrize(
-    ("iso", "expected"),
+    ("value", "expected"),
     [
-        ("2026-06-16T04:43", "04:43"),
-        ("2026-06-16T21:21:00", "21:21"),
-        ("2026-06-16", "n/a"),
-        ("", "n/a"),
+        (aware("2026-06-16T04:43"), "04:43 BST"),
+        (aware("2026-06-16T21:21:00"), "21:21 BST"),
+        (None, "n/a"),
     ],
 )
-def test_format_clock(iso: str, expected: str) -> None:
-    """A clock time is extracted from an ISO timestamp, or n/a when absent."""
-    assert format_clock(iso) == expected
+def test_format_clock(value: datetime | None, expected: str) -> None:
+    """An aware clock time includes its abbreviation, or n/a when absent."""
+    assert format_clock(value) == expected
 
 
 def test_describe_sun_times_reports_each_day() -> None:
     """Sun times render sunrise, sunset, and daylight per day."""
     almanac = (
         DayAlmanac(
-            date="2026-06-16",
-            sunrise="2026-06-16T04:43",
-            sunset="2026-06-16T21:21",
+            date=date(2026, 6, 16),
+            sunrise=aware("2026-06-16T04:43"),
+            sunset=aware("2026-06-16T21:21"),
             daylight_seconds=59880.0,
+            time_context=LONDON_SUMMER_CONTEXT,
         ),
     )
 
@@ -271,12 +302,13 @@ def test_describe_sun_times_handles_empty() -> None:
 def test_describe_solar_reports_radiation_and_hours() -> None:
     """Solar potential reports radiation in MJ/m² and durations in hours."""
     series = TimeSeries(
-        timestamps=("2026-06-15",),
+        timestamps=(date(2026, 6, 15),),
         series={
             "shortwave_radiation_sum": (28.0,),
             "sunshine_duration": (36000.0,),
             "daylight_duration": (57600.0,),
         },
+        time_context=BERLIN_SUMMER_CONTEXT,
     )
 
     summary = describe_solar("Madrid", series, max_days=1)
@@ -290,9 +322,8 @@ def test_describe_metar_renders_observed_conditions() -> None:
     """METAR rendering names the station, wind, visibility, and ceiling."""
     report = MetarReport(
         station="EGCC",
-        latitude=53.35,
-        longitude=-2.28,
-        observed="2026-06-16 12:00:00",
+        coordinates=Coordinates(53.35, -2.28),
+        observed=datetime(2026, 6, 16, 12, tzinfo=UTC),
         wind_dir_deg=240.0,
         wind_speed_kt=12.0,
         wind_gust_kt=20.0,
@@ -313,9 +344,8 @@ def test_describe_metar_handles_no_ceiling() -> None:
     """A report with no broken/overcast layer shows 'no ceiling'."""
     report = MetarReport(
         station="EGCC",
-        latitude=53.35,
-        longitude=-2.28,
-        observed="t",
+        coordinates=Coordinates(53.35, -2.28),
+        observed=datetime(2026, 6, 16, 12, tzinfo=UTC),
         wind_dir_deg=None,
         wind_speed_kt=None,
         wind_gust_kt=None,
@@ -354,8 +384,16 @@ def test_describe_airspace_none_found() -> None:
 
 def test_describe_comparison_omits_delta_when_data_missing() -> None:
     """The delta is omitted when a period has no usable values."""
-    warm = TimeSeries(timestamps=("2026-07-01",), series={"temperature_2m_max": (30.0,)})
-    empty = TimeSeries(timestamps=("2026-01-01",), series={"temperature_2m_max": (None,)})
+    warm = TimeSeries(
+        timestamps=(date(2026, 7, 1),),
+        series={"temperature_2m_max": (30.0,)},
+        time_context=BERLIN_SUMMER_CONTEXT,
+    )
+    empty = TimeSeries(
+        timestamps=(date(2026, 1, 1),),
+        series={"temperature_2m_max": (None,)},
+        time_context=BERLIN_SUMMER_CONTEXT,
+    )
 
     summary = describe_comparison("Berlin", "summer", warm, "winter", empty)
 

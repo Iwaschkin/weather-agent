@@ -11,8 +11,10 @@ It is a technical demonstrator on two levels. open-meteo is really several APIs 
 share one request/response grammar, so each capability is one Strands tool built on a
 single shared time-series boundary (`TimeSeries` + `parse_time_series`). And the drone
 assessment follows a "symbolic decides, LLM explains" design: a deterministic rules
-engine owns the `GOOD` / `MARGINAL` / `NO-FLY` verdict, raw numbers are grounded in
-labelled bands, and a faithfulness guardrail stops the model under-stating the risk.
+engine owns the `GOOD` / `MARGINAL` / `UNKNOWN` / `NO-FLY` verdict, raw numbers are grounded in
+labelled bands, and the application renders the complete decision independently of
+the model. CLI drone turns discard the model's final rewrite and show the captured
+deterministic report; dashboard model output is optional, commentary-only JSON.
 
 ## Tools
 
@@ -37,7 +39,7 @@ labelled bands, and a faithfulness guardrail stops the model under-stating the r
 | `get_aviation_weather` | aviationweather.gov | Nearest airport's observed METAR (wind, visibility, ceiling) |
 | `get_airspace` | OpenAIP (key) | Nearby controlled/restricted airspace (decision support) |
 | `get_elevation` | Elevation | Terrain height |
-| `assess_drone_conditions` | Forecast + NOAA Kp + METAR + OpenAIP | Per-hour flyability for one drone (DJI Neo, Avata 2, Mini 5 Pro) with UK CAA notes |
+| `assess_drone_conditions` | Forecast + NOAA Kp + METAR + OpenAIP | Per-hour flyability for an explicit DJI Neo/Avata 2/Mini 5 Pro configuration with UK CAA notes |
 | `assess_fleet_conditions` | Forecast + NOAA Kp + METAR + OpenAIP | All supported drones compared side by side in one call |
 | `list_supported_drones` | (none) | The drone models the assessor covers |
 
@@ -52,7 +54,15 @@ A few behaviours cut across the tools:
   `Wave height 1.4 m (moderate)` — so the model is handed meaning, not bare figures.
 - **Natural dates.** Date tools accept `today`, `tomorrow`, `in 3 days`,
   `next friday`, `2 weeks ago`, etc. as well as `YYYY-MM-DD`; the phrase is resolved
-  in code, not by the model.
+  in code, not by the model. Relative dates and daily rows use the resolved
+  location's calendar and IANA time zone, not the machine's date or an unlabeled UTC
+  day. Instant-based output names its zone; the ensemble tool requests the next
+  forecast hour instead of reporting an elapsed midnight row.
+- **Validated boundaries.** Coordinates must be finite WGS84 values before any
+  provider call; explicit location qualifiers must match; model JSON is accepted
+  only at its exact typed shape; and provider JSON decoding failures retain the
+  provider's error type. Counted date phrases are capped at 36,525 days and one
+  archive/climate request is capped at 3,660 daily rows.
 - **Multi-place and fleet requests** are single tool calls (`compare_locations`,
   `assess_fleet_conditions`): the fan-out and ranking happen deterministically
   rather than relying on the model to call a per-item tool repeatedly.
@@ -68,17 +78,43 @@ drone-tuned hourly forecast (gusts and winds up to 500 m above ground, derived
 from fixed-height and pressure-level winds), precipitation, temperature,
 visibility, daylight, low-cloud cover, thunderstorm potential (CAPE), and NOAA's
 per-hour planetary Kp forecast into an hour-by-hour `GOOD` / `MARGINAL` /
-`NO-FLY` verdict for a chosen drone, names the limiting factor, finds the best
+`UNKNOWN` / `NO-FLY` verdict for a chosen drone, names the limiting factor, finds the best
 flying window, and summarises a per-day outlook over a multi-day horizon. It adds
-UK CAA open-category guidance, the day's sunrise/sunset window, the nearest
+dated Great Britain CAA Open Category guidance, the day's sunrise/sunset window, the nearest
 airport's observed METAR (a reality check on the model, reconciled against the
 forecast for like-for-like surface gust and visibility), and nearby airspace from
-OpenAIP, plus matching tips.
+OpenAIP, plus matching tips. `UNKNOWN` means at least one required forecast sample
+was unavailable, so that hour is never recommended or included in a best window.
+NOAA Kp is supplemental: its three-hour values are used only inside their published
+coverage, and the report states when Kp is partial, current-only, malformed, or
+unavailable rather than treating absence as quiet conditions.
 
-`assess_fleet_conditions` runs the same assessment for every supported drone in a
+A METAR is treated as current for at most two hours, with no more than 15 minutes
+of future clock skew. Older or materially future reports remain visible as a typed
+source status but are not rendered or reconciled as current. A fresh observation is
+compared only with a forecast hour within 90 minutes, and the comparison is labelled
+for the METAR time rather than “now.”
+
+The UK drone path requests `Europe/London` and carries timezone-aware instants end to
+end. Elapsed-hour filtering, DST transitions, Kp buckets, METAR comparison, daily
+grouping, and best-window contiguity therefore refer to real instants. General weather
+tools remain location-local through Open-Meteo's resolved IANA zone.
+
+`assess_fleet_conditions` runs the same assessment for every supported configuration in a
 single call, fetching the forecast once and showing the drones side by side, so
 "how do all my drones look?" does not depend on the model calling the per-drone tool
-three times.
+repeatedly. The Mini 5 Pro standard- and Plus-battery states and Neo standard/FPV
+operation are separate configurations because their regulatory or operational
+contracts differ. Drone decision support rejects non-GB geocode results rather than
+presenting UK rules as local law; general weather tools remain worldwide.
+
+The final-output boundary is deliberately asymmetric. Strands receives the report as
+tool text, but the same typed `DroneResponse` is also captured in request-local
+invocation state. The CLI disables token streaming and prints that application-owned
+report after the turn, so a model answer cannot omit or lower its verdict or disclaimer.
+The web dashboard always renders the deterministic assessment first. Ollama may add
+two short validated commentary fields, but output that is malformed, too long, or
+contains flight-decision language is omitted entirely.
 
 It is decision support, not legal or airworthiness advice. The airspace section is
 **not** authoritative and does **not** cover NOTAMs - always verify with CAA Drone
@@ -89,9 +125,10 @@ Assist / Altitude Angel before flying. The airspace lookup needs an OpenAIP key
 ## Layout
 
 - `weather_agent.models` — typed value objects (`TimeSeries`, request and result types).
-- `weather_agent.parsing` — pure parsers that validate open-meteo, NOAA, aviation, and OpenAIP JSON into typed models.
+- `weather_agent.parsing` — pure parsers that validate Open-Meteo, aviation, and OpenAIP JSON into typed models.
 - `weather_agent.weather_codes` — WMO weather-code to human-readable condition lookup.
-- `weather_agent.client` — HTTP I/O for the open-meteo and NOAA endpoints (`OpenMeteoClient`).
+- `weather_agent.client` — HTTP I/O for the Open-Meteo endpoints (`OpenMeteoClient`).
+- `weather_agent.space_weather` — strict NOAA Kp object-schema parser and HTTP boundary (`SpaceWeatherClient`).
 - `weather_agent.aviation` — HTTP boundary for aviationweather.gov METARs (`AviationClient`).
 - `weather_agent.openaip` — HTTP boundary for OpenAIP airspace (`OpenAipClient`, needs a key).
 - `weather_agent.reporting` — pure formatting of time series into readable summaries.
@@ -103,9 +140,10 @@ Assist / Altitude Angel before flying. The airspace lookup needs an OpenAIP key
 - `weather_agent.caa` — pure UK CAA open-category guidance and disclaimer.
 - `weather_agent.knowledge` — keyword retrieval over the curated drone knowledge file.
 - `weather_agent.drone_report` — pure formatting of drone flight assessments (single and fleet).
-- `weather_agent.evaluation` — deterministic faithfulness checks and the runtime under-statement guardrail.
+- `weather_agent.application` — request-scoped typed capture for authoritative drone responses.
+- `weather_agent.evaluation` — lexical explanation checks used only as an offline evaluation signal.
 - `weather_agent.eval_llm` — opt-in, offline LLM-as-judge faithfulness scoring (needs Ollama).
-- `weather_agent.reporting_llm` — grounded, audited LLM-written drone reports (needs Ollama).
+- `weather_agent.reporting_llm` — optional, strictly validated commentary-only JSON (needs Ollama).
 - `weather_agent.weather` — domain logic turning a place name into a readable summary.
 - `weather_agent.results` — typed lookup outcomes (answer/not-found/invalid/failure), rendered to text at the tool boundary.
 - `weather_agent.tools` — the Strands `@tool` wrappers exposing each capability.
@@ -171,18 +209,21 @@ tunables, see the [Operators Manual](OPERATIONS.md).
 
 A [Reflex](https://reflex.dev) dashboard in [`web/`](web/) gives the drone
 assessment a graphical UI: pick a location and a horizon of up to 7 days, and see a
-per-drone flyability chart (wind/precip/temp/visibility) with a GOOD/MARGINAL/NO-FLY
+per-drone flyability chart (wind/precip/temp/visibility) with a
+GOOD/MARGINAL/UNKNOWN/NO-FLY
 ribbon and an AI-generated briefing per drone. It is a thin layer over
 `weather_agent.assess_fleet` (structured forecast) and
-`weather_agent.reporting_llm.generate_drone_report` (the grounded LLM report).
+`weather_agent.reporting_llm.generate_drone_report` (optional generated commentary).
 
 ```shell
 uv sync --group web
 cd web && uv run reflex run     # then open http://localhost:3000
 ```
 
-The charts work without Ollama; the AI briefing needs a running Ollama server
-(`ollama serve`, model pulled). See [`web/README.md`](web/README.md) for details.
+The deterministic report, charts, CAA context, source status, and disclaimer work
+without Ollama. Optional generated commentary needs a running Ollama server
+(`ollama serve`, model pulled); invalid or unavailable commentary is simply omitted.
+See [`web/README.md`](web/README.md) for details.
 
 ## Development
 
@@ -193,6 +234,8 @@ uv run ruff check .
 uv run ruff format .
 uv run pyright
 uv run pytest
+uv run pytest tests/test_web_dashboard.py
+cd web && uv run reflex export --frontend-only --no-zip
 ```
 
 ## License

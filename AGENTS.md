@@ -12,9 +12,9 @@ If a choice exists between clever code and obvious code, choose obvious code.
 - Repository type: application
 - Python version: 3.14
 - Tests enabled: yes
-- Async enabled: no
+- Async enabled: yes
 - Scripts present: no
-- Runtime annotation frameworks present: no
+- Runtime annotation frameworks present: yes (Reflex, under `web/`)
 
 ## Canonical Commands
 
@@ -22,6 +22,9 @@ If a choice exists between clever code and obvious code, choose obvious code.
 - Format: `uv run ruff format .`
 - Type check: `uv run pyright`
 - Test: `uv run pytest`
+- Web test: `uv run pytest tests/test_web_dashboard.py`
+- Web import: `cd web && uv run python -c "from weather_dashboard.weather_dashboard import app"`
+- Web build smoke test: `cd web && uv run reflex export --frontend-only --no-zip`
 
 Run tools through uv (`uv run ...`) so they use the project's locked environment. Run `uv sync` after editing `pyproject.toml` directly. Use these repo-specific commands rather than generic guesses.
 

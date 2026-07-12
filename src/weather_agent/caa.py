@@ -1,95 +1,168 @@
-"""Pure UK CAA open-category guidance for the supported drones.
+"""Dated UK CAA Open Category guidance for supported aircraft configurations.
 
-This encodes the practical UK rules a recreational pilot needs: class/weight
-banding, the 120 m height limit and its terrain clause (which is what lets you
-fly higher above a valley floor near hills), visual-line-of-sight, and ID
-requirements. It is decision support, not legal advice, and it deliberately does
-not check airspace, Flight Restriction Zones, or NOTAMs.
+The aircraft mark is configuration data supplied by :mod:`weather_agent.drone`;
+this module never manufactures a conformity mark from mass. Guidance is concise
+decision support for Great Britain and links back to the current official rules.
 """
 
 from __future__ import annotations
 
+from datetime import date
 from typing import TYPE_CHECKING
 
-from weather_agent.models import CaaGuidance
+from weather_agent.models import CaaGuidance, OpenSubcategory, RegulatoryMark
 
 if TYPE_CHECKING:
     from weather_agent.models import DroneProfile
 
-_C0_MAX_G = 250.0
-_C1_MAX_G = 900.0
+_REVIEWED_AS_OF = date(2026, 7, 12)
+_CLASS_MARKS_URL = (
+    "https://www.caa.co.uk/drones/open-category/getting-started-with-drones-and-model-aircraft/"
+    "class-marks/"
+)
+_WHERE_YOU_CAN_FLY_URL = (
+    "https://www.caa.co.uk/drones/open-category/getting-started-with-drones-and-model-aircraft/"
+    "where-you-can-fly/"
+)
+_HEIGHT_URL = (
+    "https://www.caa.co.uk/drones/open-category/drone-code/less-common-flying-points-37-to-39/"
+)
+_FPV_URL = (
+    "https://www.caa.co.uk/drones/open-category/moving-on-to-more-advanced-flying/"
+    "first-person-view-fpv/"
+)
+_REGISTRATION_URL = (
+    "https://www.caa.co.uk/drones/open-category/getting-started-with-drones-and-model-aircraft/"
+    "registering-to-fly-drones-and-model-aircraft/"
+)
+_NIGHT_URL = (
+    "https://www.caa.co.uk/drones/open-category/getting-started-with-drones-and-model-aircraft/"
+    "flying-at-night-in-the-open-category/"
+)
+_REMOTE_ID_URL = (
+    "https://www.caa.co.uk/drones/open-category/moving-on-to-more-advanced-flying/remote-id-rid/"
+)
+_DRONE_CODE_URL = "https://www.caa.co.uk/drones/open-category/drone-code/"
 
 _HEIGHT_LIMIT_NOTE = (
-    "Stay within 120 m (400 ft) of the closest point of the surface. Near terrain "
-    "or obstacles the 120 m is measured from the highest point of the nearest "
-    "obstacle within 50 m horizontally, so over a hill you can be well above the "
-    "valley floor (up to ~500 m) while still legal - provided you stay within "
-    "120 m of the hilltop and keep the drone in visual line of sight."
+    "For ordinary drone flight, stay within 120 m (400 ft) of the closest point of the "
+    "earth's surface. The separate tall-structure exception applies only when the person or "
+    "organisation responsible for an artificial structure over 105 m asks you to perform a "
+    "task related to it: while within 50 m horizontally, you may fly no more than 15 m above "
+    "that structure."
 )
-
+_A1_PEOPLE_RULE = (
+    "Current A1 rules allow flight closer than 50 m to, and over, uninvolved people, but never "
+    "over crowds; avoid deliberate overflight and always keep a safe distance."
+)
+_A2_PEOPLE_RULE = (
+    "Do not overfly uninvolved people and follow the current A2 horizontal separation required "
+    "for the aircraft and operating mode."
+)
+_A3_PEOPLE_RULE = (
+    "Do not overfly uninvolved people; remain at least 50 m from them and 150 m from residential, "
+    "recreational, commercial, or industrial areas."
+)
+_PEOPLE_RULES = {
+    OpenSubcategory.A1: _A1_PEOPLE_RULE,
+    OpenSubcategory.A2: _A2_PEOPLE_RULE,
+    OpenSubcategory.A3: _A3_PEOPLE_RULE,
+}
 _UNIVERSAL_RULES = (
-    "Keep the drone within unaided visual line of sight at all times.",
-    "Do not fly in airport/airfield Flight Restriction Zones without permission.",
-    "These drones have cameras: register for an Operator ID, label the drone, and "
-    "pass the Flyer ID test before flying.",
-    "Do not fly over crowds or assemblies of people.",
+    "Keep the aircraft in direct, unaided visual line of sight with a full view of surrounding "
+    "airspace; onboard sensing does not replace VLOS.",
+    "Do not fly in restricted airspace or an airport/airfield Flight Restriction Zone without "
+    "the required permission, and check live airspace and NOTAMs before flight.",
+    "For these camera-equipped aircraft over 100 g, the remote pilot needs a Flyer ID and the "
+    "operator needs an Operator ID; label the aircraft as required.",
+    "At night, keep a green flashing light activated throughout the Open Category flight and "
+    "continue to maintain VLOS.",
 )
-
+_FPV_RULE = (
+    "When flying by FPV video or goggles, have an observer beside you who can communicate with "
+    "you; at least one of you must maintain direct sight and a full view of surrounding airspace."
+)
 _DISCLAIMER = (
-    "This is flight-planning decision support, not legal or airworthiness advice. "
-    "You, the remote pilot, remain responsible for the flight. Always check live "
-    "airspace, Flight Restriction Zones, and NOTAMs (for example CAA Drone Assist "
-    "or Altitude Angel) before flying, and confirm the current Drone and Model "
-    "Aircraft Code rules, which can change."
-)
-
-_MINI_5_PRO_KEY = "mini5pro"
-_MINI_5_PRO_PLUS_CAVEAT = (
-    "With the Intelligent Flight Battery Plus (available in the UK) the Mini 5 Pro "
-    "exceeds 250 g, loses its C0 marking, and must then keep greater separation "
-    "from uninvolved people; treat it as a sub-900 g drone in that configuration."
+    "This is Great Britain flight-planning decision support, not legal or airworthiness advice. "
+    "You, the remote pilot, remain responsible for the flight. Verify the current CAA Drone and "
+    "Model Aircraft Code, aircraft marking/configuration, airspace, Flight Restriction Zones, "
+    "and NOTAMs before flying."
 )
 
 
-def _class_band(weight_g: float) -> tuple[str, str, str]:
-    if weight_g < _C0_MAX_G:
+def _class_label(profile: DroneProfile) -> str:
+    mark = profile.regulatory_mark
+    if mark is RegulatoryMark.EU_C0:
+        return "EU C0 (recognised as corresponding UK0 through 31 December 2027)"
+    if mark is RegulatoryMark.EU_C1:
+        return "EU C1 (recognised as corresponding UK1 through 31 December 2027)"
+    return mark.value
+
+
+def _remote_id_note(profile: DroneProfile) -> str:
+    mark = profile.regulatory_mark
+    if mark is RegulatoryMark.UK1:
         return (
-            "C0 (sub-250 g)",
-            "A1",
-            "Lightest band: you may fly over (but never intentionally close above) "
-            "uninvolved people, and not over crowds.",
-        )
-    if weight_g < _C1_MAX_G:
-        return (
-            "C1 (sub-900 g)",
-            "A1",
-            "Do not fly over uninvolved people; keep a safe horizontal distance.",
+            "Remote ID has been mandatory for UK1 operations since "
+            "1 January 2026; enter the operator's Remote ID and keep it enabled whenever flying."
         )
     return (
-        "C2 or heavier",
-        "A2/A3",
-        "Keep well clear of uninvolved people per A2/A3 separation distances.",
+        "For this camera-equipped aircraft over 100 g, Remote ID becomes mandatory by "
+        "1 January 2028; the CAA recommends enabling it earlier where supported."
     )
 
 
+def _transition_rule(profile: DroneProfile) -> str | None:
+    if profile.mark_valid_until is None:
+        return None
+    return (
+        f"The {profile.regulatory_mark.value} transition ends after "
+        f"{profile.mark_valid_until:%d %B %Y}; from the next day, re-check the aircraft's UK "
+        "status and weight-based legacy rules before flying."
+    )
+
+
+def _rules(profile: DroneProfile) -> tuple[str, ...]:
+    rules = [_PEOPLE_RULES[profile.open_subcategory], *_UNIVERSAL_RULES]
+    if profile.is_fpv:
+        rules.append(_FPV_RULE)
+    transition = _transition_rule(profile)
+    if transition is not None:
+        rules.append(transition)
+    return tuple(rules)
+
+
 def caa_guidance(profile: DroneProfile) -> CaaGuidance:
-    """Build UK CAA open-category guidance for a drone.
+    """Build sourced UK guidance from an explicit aircraft configuration.
 
     Args:
-        profile: The drone to produce guidance for.
+        profile: Supported aircraft configuration with an actual mark and dated
+            manufacturer source.
 
     Returns:
-        The class band, subcategory, height rule, universal rules, any
-        model-specific caveat, and the standing disclaimer.
+        Deterministic Great Britain Open Category guidance reviewed on the date
+        carried in the result.
     """
-    class_label, subcategory, people_rule = _class_band(profile.weight_g)
-    caveat = _MINI_5_PRO_PLUS_CAVEAT if profile.key == _MINI_5_PRO_KEY else ""
     return CaaGuidance(
         drone_name=profile.name,
-        uk_class_label=class_label,
-        subcategory=subcategory,
+        configuration=profile.configuration,
+        jurisdiction="Great Britain",
+        aircraft_class=_class_label(profile),
+        subcategory=profile.open_subcategory,
         height_limit_note=_HEIGHT_LIMIT_NOTE,
-        key_rules=(people_rule, *_UNIVERSAL_RULES),
-        class_caveat=caveat,
+        key_rules=_rules(profile),
+        remote_id_note=_remote_id_note(profile),
+        reviewed_as_of=_REVIEWED_AS_OF,
+        source_urls=(
+            profile.regulatory_source,
+            _CLASS_MARKS_URL,
+            _WHERE_YOU_CAN_FLY_URL,
+            _HEIGHT_URL,
+            _FPV_URL,
+            _REGISTRATION_URL,
+            _NIGHT_URL,
+            _REMOTE_ID_URL,
+            _DRONE_CODE_URL,
+        ),
         disclaimer=_DISCLAIMER,
     )

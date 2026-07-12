@@ -18,6 +18,10 @@ import re
 from datetime import date, timedelta
 
 _DAYS_PER_WEEK = 7
+# Natural-language offsets are user convenience, not an unbounded date-arithmetic
+# interface. One hundred years covers the product's provider ranges with room to
+# spare while rejecting pathological integer and timedelta inputs early.
+MAX_RELATIVE_DAYS = 36_525
 
 # Exact phrases mapping to a fixed offset in days from the reference date.
 _OFFSETS: dict[str, int] = {
@@ -45,30 +49,43 @@ _AGO_RE = re.compile(r"(\d+) (day|week)s? ago")
 _WEEKDAY_RE = re.compile(r"(?:(next|this|last) )?(\w+)")
 
 
-def _count_delta(match: re.Match[str]) -> timedelta:
-    count = int(match.group(1))
+def _count_delta(match: re.Match[str]) -> timedelta | None:
+    try:
+        count = int(match.group(1))
+    except ValueError:
+        return None
     span = _DAYS_PER_WEEK if match.group(2) == "week" else 1
-    return timedelta(days=count * span)
+    days = count * span
+    return timedelta(days=days) if days <= MAX_RELATIVE_DAYS else None
+
+
+def _apply_delta(today: date, delta: timedelta) -> date | None:
+    try:
+        return today + delta
+    except OverflowError:
+        return None
 
 
 def _relative_count(text: str, today: date) -> date | None:
     forward = _IN_RE.fullmatch(text)
     if forward is not None:
-        return today + _count_delta(forward)
+        delta = _count_delta(forward)
+        return None if delta is None else _apply_delta(today, delta)
     backward = _AGO_RE.fullmatch(text)
     if backward is not None:
-        return today - _count_delta(backward)
+        delta = _count_delta(backward)
+        return None if delta is None else _apply_delta(today, -delta)
     return None
 
 
-def _next_weekday(today: date, weekday: int) -> date:
+def _next_weekday(today: date, weekday: int) -> date | None:
     ahead = (weekday - today.weekday()) % _DAYS_PER_WEEK or _DAYS_PER_WEEK
-    return today + timedelta(days=ahead)
+    return _apply_delta(today, timedelta(days=ahead))
 
 
-def _previous_weekday(today: date, weekday: int) -> date:
+def _previous_weekday(today: date, weekday: int) -> date | None:
     behind = (today.weekday() - weekday) % _DAYS_PER_WEEK or _DAYS_PER_WEEK
-    return today - timedelta(days=behind)
+    return _apply_delta(today, timedelta(days=-behind))
 
 
 def _weekday(text: str, today: date) -> date | None:
@@ -109,7 +126,7 @@ def resolve_day(text: str, today: date) -> date | None:
         return iso
     offset = _OFFSETS.get(cleaned)
     if offset is not None:
-        return today + timedelta(days=offset)
+        return _apply_delta(today, timedelta(days=offset))
     counted = _relative_count(cleaned, today)
     if counted is not None:
         return counted

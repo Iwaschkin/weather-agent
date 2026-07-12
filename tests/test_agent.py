@@ -1,6 +1,8 @@
 """Tests for the assembled weather agent's static wiring."""
 
-from weather_agent.agent import _SYSTEM_PROMPT, _TOOLS
+from strands.handlers.callback_handler import null_callback_handler
+
+from weather_agent.agent import _SYSTEM_PROMPT, _TOOLS, build_agent
 
 
 def test_system_prompt_names_every_wired_tool() -> None:
@@ -13,3 +15,10 @@ def test_system_prompt_names_every_wired_tool() -> None:
     """
     unmentioned = [t.tool_name for t in _TOOLS if t.tool_name not in _SYSTEM_PROMPT]
     assert unmentioned == []
+
+
+def test_agent_uses_null_callback_until_application_selects_output() -> None:
+    """Model tokens are not streamed before the CLI can select a captured decision."""
+    agent = build_agent()
+
+    assert agent.callback_handler is null_callback_handler

@@ -8,29 +8,35 @@ reality check (wind, visibility, cloud ceiling) to sit beside the model forecast
 
 from __future__ import annotations
 
-from math import asin, cos, radians, sin, sqrt
+import json
+from math import asin, cos, isfinite, radians, sin, sqrt
 from typing import TYPE_CHECKING
 
 import httpx
 
-from weather_agent.parsing import parse_metars
+from weather_agent.parsing import AviationError, parse_metars
 
 if TYPE_CHECKING:
-    from weather_agent.models import MetarReport
+    from weather_agent.models import Coordinates, MetarReport
 
 _METAR_URL = "https://aviationweather.gov/api/data/metar"
 _DEFAULT_TIMEOUT = 10.0
 # Half-extent of the bounding box searched around the point, in degrees
 # (~111 km), wide enough to catch a reporting airfield for most inhabited places.
 _DEFAULT_SEARCH_DEGREES = 1.0
+_MAX_SEARCH_DEGREES = 5.0
 _EARTH_RADIUS_KM = 6371.0
+_HTTP_NO_CONTENT = 204
 
 
-def _haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+def _haversine_km(origin: Coordinates, destination: Coordinates) -> float:
     """Return the great-circle distance between two coordinates, in kilometres."""
-    d_lat = radians(lat2 - lat1)
-    d_lon = radians(lon2 - lon1)
-    a = sin(d_lat / 2) ** 2 + cos(radians(lat1)) * cos(radians(lat2)) * sin(d_lon / 2) ** 2
+    d_lat = radians(destination.latitude - origin.latitude)
+    d_lon = radians(destination.longitude - origin.longitude)
+    a = (
+        sin(d_lat / 2) ** 2
+        + cos(radians(origin.latitude)) * cos(radians(destination.latitude)) * sin(d_lon / 2) ** 2
+    )
     return 2 * _EARTH_RADIUS_KM * asin(sqrt(min(1.0, a)))
 
 
@@ -52,15 +58,13 @@ class AviationClient:
 
     def nearest_metar(
         self,
-        latitude: float,
-        longitude: float,
+        coordinates: Coordinates,
         search_degrees: float = _DEFAULT_SEARCH_DEGREES,
     ) -> MetarReport | None:
         """Fetch the nearest reporting station's METAR to a coordinate.
 
         Args:
-            latitude: Latitude in decimal degrees.
-            longitude: Longitude in decimal degrees.
+            coordinates: Validated WGS84 coordinate pair.
             search_degrees: Half-extent of the search box around the point.
 
         Returns:
@@ -68,23 +72,34 @@ class AviationClient:
             within the search box.
 
         Raises:
+            ValueError: If ``search_degrees`` is not finite and in ``(0, 5]``.
             httpx.HTTPError: If the request fails or returns an error status.
             AviationError: If the response is not a JSON array.
         """
+        if not isfinite(search_degrees) or not 0 < search_degrees <= _MAX_SEARCH_DEGREES:
+            message = f"search_degrees must be finite and in (0, {_MAX_SEARCH_DEGREES}]"
+            raise ValueError(message)
         bbox = (
-            f"{latitude - search_degrees},{longitude - search_degrees},"
-            f"{latitude + search_degrees},{longitude + search_degrees}"
+            f"{coordinates.latitude - search_degrees},"
+            f"{coordinates.longitude - search_degrees},"
+            f"{coordinates.latitude + search_degrees},"
+            f"{coordinates.longitude + search_degrees}"
         )
         response = self._client.get(_METAR_URL, params={"format": "json", "bbox": bbox})
         _ = response.raise_for_status()
-        reports = parse_metars(response.json())
+        if response.status_code == _HTTP_NO_CONTENT:
+            return None
+        try:
+            payload: object = response.json()
+        except json.JSONDecodeError as error:
+            message = "response is not valid JSON"
+            raise AviationError(message) from error
+        reports = parse_metars(payload)
         if not reports:
             return None
         return min(
             reports,
-            key=lambda report: _haversine_km(
-                latitude, longitude, report.latitude, report.longitude
-            ),
+            key=lambda report: _haversine_km(coordinates, report.coordinates),
         )
 
     def close(self) -> None:

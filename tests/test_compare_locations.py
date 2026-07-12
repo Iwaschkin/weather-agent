@@ -2,6 +2,7 @@
 
 import httpx
 
+from tests.time_helpers import epoch, time_metadata
 from weather_agent.client import OpenMeteoClient
 from weather_agent.reporting import describe_location_comparison
 from weather_agent.results import render
@@ -26,7 +27,15 @@ def _multi_client() -> OpenMeteoClient:
             return httpx.Response(
                 200,
                 json={
-                    "results": [{"name": name, "country": "X", "latitude": lat, "longitude": lon}]
+                    "results": [
+                        {
+                            "name": name,
+                            "country": "X",
+                            "latitude": lat,
+                            "longitude": lon,
+                            "timezone": "UTC",
+                        }
+                    ]
                 },
             )
         latitude = float(request.url.params["latitude"])
@@ -36,12 +45,13 @@ def _multi_client() -> OpenMeteoClient:
         return httpx.Response(
             200,
             json={
+                **time_metadata("UTC", "UTC", 0),
                 "current": {
-                    "time": "2026-06-17T12:00",
+                    "time": epoch("2026-06-17T12:00", "UTC"),
                     "temperature_2m": temp,
                     "wind_speed_10m": 5.0,
                     "cloud_cover": cloud,
-                }
+                },
             },
         )
 

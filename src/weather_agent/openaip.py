@@ -13,19 +13,21 @@ available, :attr:`OpenAipClient.has_key` is ``False`` and callers degrade to an
 
 from __future__ import annotations
 
+import json
 import os
 from typing import TYPE_CHECKING
 
 import httpx
 
-from weather_agent.parsing import parse_airspaces
+from weather_agent.parsing import AirspaceError, parse_airspaces
 
 if TYPE_CHECKING:
-    from weather_agent.models import Airspace
+    from weather_agent.models import Airspace, Coordinates
 
 _AIRSPACES_URL = "https://api.core.openaip.net/api/airspaces"
 _DEFAULT_TIMEOUT = 10.0
 _DEFAULT_RADIUS_M = 15000
+_MAX_RADIUS_M = 100000
 _MAX_RESULTS = 50
 _API_KEY_ENV = "OPENAIP_API_KEY"
 
@@ -71,26 +73,28 @@ class OpenAipClient:
 
     def nearby_airspaces(
         self,
-        latitude: float,
-        longitude: float,
+        coordinates: Coordinates,
         radius_m: int = _DEFAULT_RADIUS_M,
     ) -> tuple[Airspace, ...]:
         """Fetch drone-relevant airspaces within a radius of a coordinate.
 
         Args:
-            latitude: Latitude in decimal degrees.
-            longitude: Longitude in decimal degrees.
+            coordinates: Validated WGS84 coordinate pair.
             radius_m: Search radius around the point, in metres.
 
         Returns:
             Nearby airspaces filtered to low-level drone-relevant types.
 
         Raises:
+            ValueError: If ``radius_m`` is not an integer from 1 to 100000 metres.
             httpx.HTTPError: If the request fails or returns an error status.
             AirspaceError: If the response shape is unexpected.
         """
+        if isinstance(radius_m, bool) or not 1 <= radius_m <= _MAX_RADIUS_M:
+            message = f"radius_m must be between 1 and {_MAX_RADIUS_M}"
+            raise ValueError(message)
         params: dict[str, str | int] = {
-            "pos": f"{latitude},{longitude}",
+            "pos": f"{coordinates.latitude},{coordinates.longitude}",
             "dist": radius_m,
             "limit": _MAX_RESULTS,
         }
@@ -98,7 +102,12 @@ class OpenAipClient:
             _AIRSPACES_URL, params=params, headers={"x-openaip-api-key": self._api_key}
         )
         _ = response.raise_for_status()
-        return relevant_airspaces(parse_airspaces(response.json()))
+        try:
+            payload: object = response.json()
+        except json.JSONDecodeError as error:
+            message = "response is not valid JSON"
+            raise AirspaceError(message) from error
+        return relevant_airspaces(parse_airspaces(payload))
 
     def close(self) -> None:
         """Close the underlying HTTP connection pool."""

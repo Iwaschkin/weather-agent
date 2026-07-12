@@ -2,10 +2,14 @@
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 import reflex as rx
 
 from weather_dashboard.state import DashboardState
-from weather_dashboard.transform import DroneView
+
+if TYPE_CHECKING:
+    from weather_dashboard.transform import DroneView
 
 _DAY_OPTIONS = [str(day) for day in range(1, 8)]
 _RIBBON_TRANSITION = {"transition": "background 0.3s ease"}
@@ -17,6 +21,7 @@ def _verdict_color(verdict: rx.Var[str]) -> rx.Var[str]:
         verdict,
         ("good", rx.color("grass", 9)),
         ("marginal", rx.color("amber", 9)),
+        ("unknown", rx.color("gray", 9)),
         ("no_fly", rx.color("tomato", 9)),
         rx.color("gray", 6),
     )
@@ -57,29 +62,51 @@ def _controls() -> rx.Component:
     )
 
 
+def _metric_label() -> rx.Var[str]:
+    return rx.match(
+        DashboardState.metric,
+        ("wind", "Wind (m/s)"),
+        ("precip", "Precipitation probability (%)"),
+        ("temp", "Temperature (C)"),
+        ("vis", "Visibility (km)"),
+        "Metric",
+    )
+
+
 def _chart(drone: DroneView) -> rx.Component:
-    return rx.recharts.area_chart(
-        rx.recharts.area(
-            data_key=DashboardState.metric,
-            stroke=rx.color("accent", 9),
-            fill=rx.color("accent", 5),
-            type_="monotone",
+    return rx.vstack(
+        rx.text(
+            _metric_label(),
+            " · Forecast times: ",
+            drone.timezone,
+            size="1",
+            color_scheme="gray",
         ),
-        rx.cond(
-            DashboardState.metric == "wind",
-            rx.recharts.reference_line(
-                y=drone.limit.to_string(),
-                stroke=rx.color("tomato", 9),
-                stroke_dasharray="4 4",
+        rx.recharts.area_chart(
+            rx.recharts.area(
+                data_key=DashboardState.metric,
+                stroke=rx.color("accent", 9),
+                fill=rx.color("accent", 5),
+                type_="monotone",
             ),
-            rx.fragment(),
+            rx.cond(
+                DashboardState.metric == "wind",
+                rx.recharts.reference_line(
+                    y=drone.limit.to_string(),
+                    stroke=rx.color("tomato", 9),
+                    stroke_dasharray="4 4",
+                ),
+                rx.fragment(),
+            ),
+            rx.recharts.x_axis(data_key="time", interval=11, min_tick_gap=20),
+            rx.recharts.y_axis(width=36),
+            rx.recharts.cartesian_grid(stroke_dasharray="3 3", vertical=False),
+            rx.recharts.graphing_tooltip(),
+            data=drone.rows,
+            height=180,
+            width="100%",
         ),
-        rx.recharts.x_axis(data_key="time", interval=11, min_tick_gap=20),
-        rx.recharts.y_axis(width=36),
-        rx.recharts.cartesian_grid(stroke_dasharray="3 3", vertical=False),
-        rx.recharts.graphing_tooltip(),
-        data=drone.rows,
-        height=180,
+        spacing="1",
         width="100%",
     )
 
@@ -105,7 +132,12 @@ def _report(drone: DroneView) -> rx.Component:
     return rx.box(
         rx.cond(
             DashboardState.reports.contains(drone.name),
-            rx.text(DashboardState.reports[drone.name], size="2", class_name="fade-in"),
+            rx.vstack(
+                rx.text("Generated commentary", weight="bold", size="2"),
+                rx.text(DashboardState.reports[drone.name], size="2", class_name="fade-in"),
+                spacing="1",
+                align="start",
+            ),
             rx.cond(
                 DashboardState.generating,
                 rx.hstack(
@@ -115,6 +147,38 @@ def _report(drone: DroneView) -> rx.Component:
                 rx.fragment(),
             ),
         ),
+        width="100%",
+    )
+
+
+def _authoritative_report(drone: DroneView) -> rx.Component:
+    return rx.callout(
+        rx.vstack(
+            rx.text("Authoritative deterministic assessment", weight="bold", size="2"),
+            rx.text("Configuration: ", drone.configuration, size="1"),
+            rx.text("CAA context: ", drone.caa_context, size="1"),
+            rx.foreach(
+                drone.source_statuses,
+                lambda status: rx.text("Source: ", status, size="1"),
+            ),
+            rx.text("Airspace: ", drone.airspace_status, size="1"),
+            rx.text(
+                drone.authoritative_report,
+                size="1",
+                white_space="pre-wrap",
+            ),
+            rx.callout(
+                drone.disclaimer,
+                icon="triangle-alert",
+                color_scheme="amber",
+                size="1",
+                width="100%",
+            ),
+            align="start",
+            spacing="2",
+        ),
+        icon="shield-check",
+        color_scheme="gray",
         width="100%",
     )
 
@@ -131,6 +195,7 @@ def _legend() -> rx.Component:
     return rx.hstack(
         swatch("Good", "grass"),
         swatch("Marginal", "amber"),
+        swatch("Unknown", "gray"),
         swatch("No-fly", "tomato"),
         spacing="4",
     )
@@ -142,13 +207,18 @@ def _drone_card(drone: DroneView) -> rx.Component:
             rx.hstack(
                 rx.heading(drone.name, size="4"),
                 rx.spacer(),
-                rx.badge(drone.best_window, color_scheme="grass", variant="soft"),
+                rx.badge(
+                    drone.best_window,
+                    color_scheme=drone.best_window_color,
+                    variant="soft",
+                ),
                 width="100%",
                 align="center",
             ),
             rx.text(drone.summary, color_scheme="gray", size="2"),
             _chart(drone),
             _ribbon(drone),
+            _authoritative_report(drone),
             _report(drone),
             spacing="3",
             width="100%",
@@ -165,7 +235,8 @@ def index() -> rx.Component:
         rx.vstack(
             rx.heading("Drone Flyability Forecast", size="7"),
             rx.text(
-                "Pick a location and horizon for a per-drone outlook and an AI briefing.",
+                "Pick a location and horizon for deterministic per-drone decision support; "
+                "generated commentary is optional.",
                 color_scheme="gray",
             ),
             _controls(),

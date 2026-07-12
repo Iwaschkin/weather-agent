@@ -1,7 +1,10 @@
 """Tests for the pure open-meteo payload parsers."""
 
+from datetime import date
+
 import pytest
 
+from tests.time_helpers import aware, epoch, time_metadata
 from weather_agent.parsing import (
     AirspaceError,
     AviationError,
@@ -27,6 +30,7 @@ def test_parse_geocode_results_extracts_fields() -> None:
                 "country": "Germany",
                 "latitude": 52.52,
                 "longitude": 13.41,
+                "timezone": "Europe/Berlin",
             },
         ],
     }
@@ -36,8 +40,8 @@ def test_parse_geocode_results_extracts_fields() -> None:
     assert len(results) == 1
     assert results[0].name == "Berlin"
     assert results[0].country == "Germany"
-    assert results[0].latitude == 52.52
-    assert results[0].longitude == 13.41
+    assert results[0].coordinates.latitude == 52.52
+    assert results[0].coordinates.longitude == 13.41
 
 
 def test_parse_geocode_results_extracts_disambiguation_fields() -> None:
@@ -52,6 +56,7 @@ def test_parse_geocode_results_extracts_disambiguation_fields() -> None:
                 "population": 26482,
                 "latitude": 53.16,
                 "longitude": -2.21,
+                "timezone": "Europe/London",
             },
         ],
     }
@@ -66,7 +71,7 @@ def test_parse_geocode_results_extracts_disambiguation_fields() -> None:
 def test_parse_geocode_results_defaults_disambiguation_fields() -> None:
     """Missing disambiguation fields fall back to empty/None."""
     payload: dict[str, object] = {
-        "results": [{"name": "Nowhere", "latitude": 0.0, "longitude": 0.0}],
+        "results": [{"name": "Nowhere", "latitude": 0.0, "longitude": 0.0, "timezone": "UTC"}],
     }
 
     result = parse_geocode_results(payload)[0]
@@ -84,12 +89,29 @@ def test_parse_geocode_results_missing_results_is_empty() -> None:
 def test_parse_geocode_results_defaults_missing_country() -> None:
     """A match without a country falls back to an empty string."""
     payload: dict[str, object] = {
-        "results": [{"name": "Nowhere", "latitude": 0.0, "longitude": 0.0}],
+        "results": [{"name": "Nowhere", "latitude": 0.0, "longitude": 0.0, "timezone": "UTC"}],
     }
 
     results = parse_geocode_results(payload)
 
     assert results[0].country == ""
+
+
+def test_parse_geocode_results_rejects_unknown_timezone() -> None:
+    """A geocoder result cannot introduce a timezone the runtime cannot resolve."""
+    payload: dict[str, object] = {
+        "results": [
+            {
+                "name": "Nowhere",
+                "latitude": 0.0,
+                "longitude": 0.0,
+                "timezone": "Mars/Olympus_Mons",
+            },
+        ],
+    }
+
+    with pytest.raises(OpenMeteoError, match="unknown geocoding timezone"):
+        _ = parse_geocode_results(payload)
 
 
 _MALFORMED_GEOCODE: list[object] = [
@@ -110,8 +132,9 @@ def test_parse_geocode_results_rejects_malformed(payload: object) -> None:
 def test_parse_current_weather_extracts_fields() -> None:
     """A well-formed forecast payload yields typed current weather."""
     payload: dict[str, object] = {
+        **time_metadata("Europe/Berlin", "CEST", 7200),
         "current": {
-            "time": "2026-06-15T12:00",
+            "time": epoch("2026-06-15T12:00", "Europe/Berlin"),
             "temperature_2m": 21.3,
             "wind_speed_10m": 9.7,
         },
@@ -119,7 +142,7 @@ def test_parse_current_weather_extracts_fields() -> None:
 
     weather = parse_current_weather(payload)
 
-    assert weather.time == "2026-06-15T12:00"
+    assert weather.time == aware("2026-06-15T12:00", "Europe/Berlin")
     assert weather.temperature_celsius == 21.3
     assert weather.wind_speed_kmh == 9.7
 
@@ -138,11 +161,51 @@ def test_parse_current_weather_rejects_malformed(payload: object) -> None:
         _ = parse_current_weather(payload)
 
 
+@pytest.mark.parametrize(
+    "metadata",
+    [
+        {"timezone_abbreviation": "CEST", "utc_offset_seconds": 7200},
+        {"timezone": "Europe/Berlin", "utc_offset_seconds": 7200},
+        {
+            "timezone": "Mars/Olympus_Mons",
+            "timezone_abbreviation": "MST",
+            "utc_offset_seconds": 0,
+        },
+        {
+            "timezone": "Europe/Berlin",
+            "timezone_abbreviation": "",
+            "utc_offset_seconds": 7200,
+        },
+        {
+            "timezone": "Europe/Berlin",
+            "timezone_abbreviation": "CEST",
+            "utc_offset_seconds": 100_000,
+        },
+    ],
+)
+def test_parse_current_weather_requires_valid_time_metadata(
+    metadata: dict[str, object],
+) -> None:
+    """Missing or unusable provider timezone metadata fails at the JSON boundary."""
+    payload: dict[str, object] = {
+        **metadata,
+        "current": {
+            "time": epoch("2026-06-15T12:00", "Europe/Berlin"),
+            "temperature_2m": 21.3,
+            "wind_speed_10m": 9.7,
+        },
+    }
+
+    with pytest.raises(OpenMeteoError):
+        _ = parse_current_weather(payload)
+
+
 def test_parse_current_weather_reads_optional_fields() -> None:
     """Condition code and the richer optional fields are parsed when present."""
     payload: dict[str, object] = {
+        **time_metadata("Europe/Berlin", "CEST", 7200),
         "current": {
-            "time": "2026-06-15T12:00",
+            "time": epoch("2026-06-15T12:00", "Europe/Berlin"),
             "temperature_2m": 21.3,
             "wind_speed_10m": 9.7,
             "weather_code": 61,
@@ -163,7 +226,12 @@ def test_parse_current_weather_reads_optional_fields() -> None:
 def test_parse_current_weather_optional_fields_default_none() -> None:
     """Absent optional fields are None, not errors."""
     payload: dict[str, object] = {
-        "current": {"time": "t", "temperature_2m": 1.0, "wind_speed_10m": 2.0},
+        **time_metadata("Europe/Berlin", "CEST", 7200),
+        "current": {
+            "time": epoch("2026-06-15T12:00", "Europe/Berlin"),
+            "temperature_2m": 1.0,
+            "wind_speed_10m": 2.0,
+        },
     }
 
     weather = parse_current_weather(payload)
@@ -179,7 +247,7 @@ def test_parse_metars_extracts_fields_and_ceiling() -> None:
             "icaoId": "EGCC",
             "lat": 53.35,
             "lon": -2.28,
-            "reportTime": "2026-06-16 12:00:00",
+            "reportTime": "2026-06-16T12:00:00Z",
             "wdir": 240,
             "wspd": 12,
             "wgst": 20,
@@ -209,6 +277,22 @@ def test_parse_metars_rejects_non_list() -> None:
     """A non-array METAR payload raises an aviation error."""
     with pytest.raises(AviationError):
         _ = parse_metars({"not": "a list"})
+
+
+@pytest.mark.parametrize(
+    "entry",
+    [
+        {"icaoId": "EGCC", "lat": 53.35, "lon": -2.28, "reportTime": "not-a-time"},
+        {"icaoId": "EGCC", "lat": 53.35, "lon": -2.28, "reportTime": "2026-06-16T12:00"},
+        {"icaoId": "EGCC", "lat": 91.0, "lon": -2.28, "reportTime": "2026-06-16T12:00Z"},
+    ],
+)
+def test_parse_metars_rejects_invalid_required_observation_fields(
+    entry: dict[str, object],
+) -> None:
+    """A station-like row with invalid time or coordinates is malformed, not absent."""
+    with pytest.raises(AviationError):
+        _ = parse_metars([entry])
 
 
 def test_parse_airspaces_maps_codes_and_limits() -> None:
@@ -248,12 +332,13 @@ def test_parse_airspaces_rejects_missing_items() -> None:
 
 
 def test_parse_daily_almanac_reads_sun_times() -> None:
-    """The almanac parser reads string sunrise/sunset and numeric daylight."""
+    """The almanac parser reads aware sunrise/sunset instants and daylight."""
     payload: dict[str, object] = {
+        **time_metadata(),
         "daily": {
-            "time": ["2026-06-16", "2026-06-17"],
-            "sunrise": ["2026-06-16T04:43", "2026-06-17T04:43"],
-            "sunset": ["2026-06-16T21:21", "2026-06-17T21:22"],
+            "time": [epoch("2026-06-16T00:00"), epoch("2026-06-17T00:00")],
+            "sunrise": [epoch("2026-06-16T04:43"), epoch("2026-06-17T04:43")],
+            "sunset": [epoch("2026-06-16T21:21"), epoch("2026-06-17T21:22")],
             "daylight_duration": [59880.0, 59940.0],
         },
     }
@@ -261,31 +346,36 @@ def test_parse_daily_almanac_reads_sun_times() -> None:
     almanac = parse_daily_almanac(payload)
 
     assert len(almanac) == 2
-    assert almanac[0].date == "2026-06-16"
-    assert almanac[0].sunrise == "2026-06-16T04:43"
+    assert almanac[0].date == date(2026, 6, 16)
+    assert almanac[0].sunrise == aware("2026-06-16T04:43")
     assert almanac[0].daylight_seconds == 59880.0
 
 
-def test_parse_daily_almanac_tolerates_missing_columns() -> None:
-    """Missing sun columns degrade to empty strings and None, not errors."""
-    payload: dict[str, object] = {"daily": {"time": ["2026-06-16"]}}
+def test_parse_daily_almanac_rejects_missing_time_columns() -> None:
+    """Missing sun columns cannot masquerade as a complete almanac response."""
+    payload: dict[str, object] = {
+        **time_metadata(),
+        "daily": {"time": [epoch("2026-06-16T00:00")]},
+    }
 
-    almanac = parse_daily_almanac(payload)
-
-    assert almanac[0].sunrise == ""
-    assert almanac[0].daylight_seconds is None
+    with pytest.raises(OpenMeteoError):
+        _ = parse_daily_almanac(payload)
 
 
 def test_parse_uv_index_reads_current_and_today_max() -> None:
     """UV parsing reads the current value and today's daily maximum."""
     payload: dict[str, object] = {
-        "current": {"time": "2026-06-15T12:00", "uv_index": 4.2},
-        "daily": {"time": ["2026-06-15"], "uv_index_max": [7.8]},
+        **time_metadata("Europe/Berlin", "CEST", 7200),
+        "current": {"time": epoch("2026-06-15T12:00", "Europe/Berlin"), "uv_index": 4.2},
+        "daily": {
+            "time": [epoch("2026-06-15T00:00", "Europe/Berlin")],
+            "uv_index_max": [7.8],
+        },
     }
 
     uv = parse_uv_index(payload)
 
-    assert uv.time == "2026-06-15T12:00"
+    assert uv.time == aware("2026-06-15T12:00", "Europe/Berlin")
     assert uv.current == 4.2
     assert uv.today_max == 7.8
 
@@ -293,7 +383,8 @@ def test_parse_uv_index_reads_current_and_today_max() -> None:
 def test_parse_uv_index_missing_daily_max_is_none() -> None:
     """An empty daily block leaves today's max as None."""
     payload: dict[str, object] = {
-        "current": {"time": "t", "uv_index": 1.0},
+        **time_metadata(),
+        "current": {"time": epoch("2026-06-15T12:00"), "uv_index": 1.0},
         "daily": {"time": []},
     }
 
@@ -303,8 +394,9 @@ def test_parse_uv_index_missing_daily_max_is_none() -> None:
 def test_parse_current_readings_extracts_present_hour() -> None:
     """The current block yields the present-hour scalars, ignoring metadata."""
     payload: dict[str, object] = {
+        **time_metadata("Europe/Berlin", "CEST", 7200),
         "current": {
-            "time": "2026-06-15T13:00",
+            "time": epoch("2026-06-15T13:00", "Europe/Berlin"),
             "interval": 3600,
             "pm2_5": 12.0,
             "european_aqi": 33.0,
@@ -314,7 +406,7 @@ def test_parse_current_readings_extracts_present_hour() -> None:
 
     readings = parse_current_readings(payload)
 
-    assert readings.time == "2026-06-15T13:00"
+    assert readings.time == aware("2026-06-15T13:00", "Europe/Berlin")
     assert readings.values == {"pm2_5": 12.0, "european_aqi": 33.0, "ozone": None}
     assert "interval" not in readings.values
 
@@ -337,8 +429,12 @@ def test_parse_current_readings_rejects_malformed(payload: object) -> None:
 def test_parse_time_series_extracts_columns() -> None:
     """A well-formed block yields aligned timestamps and variable columns."""
     payload: dict[str, object] = {
+        **time_metadata("Europe/Berlin", "CEST", 7200),
         "daily": {
-            "time": ["2026-06-14", "2026-06-15"],
+            "time": [
+                epoch("2026-06-14T00:00", "Europe/Berlin"),
+                epoch("2026-06-15T00:00", "Europe/Berlin"),
+            ],
             "temperature_2m_max": [21.0, 23.5],
             "precipitation_sum": [0.0, 4.2],
         },
@@ -346,16 +442,47 @@ def test_parse_time_series_extracts_columns() -> None:
 
     series = parse_time_series(payload, "daily")
 
-    assert series.timestamps == ("2026-06-14", "2026-06-15")
+    assert series.timestamps == (date(2026, 6, 14), date(2026, 6, 15))
     assert series.column("temperature_2m_max") == (21.0, 23.5)
     assert series.column("precipitation_sum") == (0.0, 4.2)
     assert "time" not in series.series
 
 
+@pytest.mark.parametrize(
+    ("timezone", "abbreviation", "offset"),
+    [
+        ("Asia/Tokyo", "JST", 32_400),
+        ("America/Los_Angeles", "PDT", -25_200),
+    ],
+)
+def test_parse_daily_series_preserves_location_calendar_date(
+    timezone: str,
+    abbreviation: str,
+    offset: int,
+) -> None:
+    """Unix instants for local midnight remain the requested location's date."""
+    payload: dict[str, object] = {
+        **time_metadata(timezone, abbreviation, offset),
+        "daily": {
+            "time": [epoch("2026-06-16T00:00", timezone)],
+            "temperature_2m_max": [21.0],
+        },
+    }
+
+    series = parse_time_series(payload, "daily")
+
+    assert series.timestamps == (date(2026, 6, 16),)
+    assert series.time_context.timezone == timezone
+
+
 def test_parse_time_series_preserves_null_gaps() -> None:
     """Open-meteo emits null for missing samples, preserved as None."""
     payload: dict[str, object] = {
-        "hourly": {"time": ["2026-06-14T00:00", "2026-06-14T01:00"], "cloud_cover": [55.0, None]},
+        **time_metadata(),
+        "hourly": {
+            "time": [epoch("2026-06-14T00:00"), epoch("2026-06-14T01:00")],
+            "cloud_cover": [55.0, None],
+        },
     }
 
     series = parse_time_series(payload, "hourly")

@@ -3,7 +3,11 @@
 from strands import (
     tool,  # pyright: ignore[reportUnknownVariableType]  # strands' tool overload is partially untyped
 )
+from strands.types.tools import (
+    ToolContext,  # noqa: TC002  # Strands resolves this annotation at decoration time.
+)
 
+from weather_agent.application import DECISION_CAPTURE_KEY, DecisionCapture, DroneResponse
 from weather_agent.drone import DRONE_PROFILES
 from weather_agent.drone_report import describe_supported_drones
 from weather_agent.results import render
@@ -15,10 +19,10 @@ from weather_agent.weather import (
     compare_periods,
     current_weather_at_coordinates,
     current_weather_summary,
-    drone_flight_summary,
+    drone_flight_response,
     elevation_summary,
     ensemble_summary,
-    fleet_flight_summary,
+    fleet_flight_response,
     forecast_summary,
     historical_summary,
     marine_summary,
@@ -30,6 +34,12 @@ from weather_agent.weather import (
     uv_index_summary,
     weather_for_date,
 )
+
+
+def _record_drone_response(tool_context: ToolContext, response: DroneResponse) -> None:
+    capture_value: object = tool_context.invocation_state.get(DECISION_CAPTURE_KEY)
+    if isinstance(capture_value, DecisionCapture):
+        capture_value.record(response)
 
 
 @tool
@@ -355,58 +365,69 @@ def compare_locations(locations: list[str], metric: str = "temperature") -> str:
     return render(rank_locations(tuple(locations), metric))
 
 
-@tool
-def assess_drone_conditions(location: str, drone: str) -> str:
+@tool(context=True)
+def assess_drone_conditions(location: str, drone: str, tool_context: ToolContext) -> str:
     """Assess whether weather is suitable for flying one specific drone today.
 
     Use this for a single named drone. To cover the whole fleet (for example
     "all my drones" or "every drone"), use ``assess_fleet_conditions`` instead -
     do not call this tool once per drone.
 
-    Covers the DJI Neo, Avata 2, and Mini 5 Pro. Combines wind and gusts up to
+    Covers explicit DJI Neo, Avata 2, and Mini 5 Pro operating/battery
+    configurations. Combines wind and gusts up to
     500 m, precipitation, temperature, visibility, daylight, thunderstorm
     potential, and geomagnetic (Kp) activity into an hour-by-hour verdict, then
-    adds UK CAA guidance and practical tips. Always relay the safety disclaimer.
+    adds dated Great Britain CAA guidance and practical tips. Always relay the
+    safety disclaimer.
 
-    This tool is UK-scoped: the guidance follows UK CAA open-category rules and
-    hourly timestamps are reported in UK local time, so for non-UK locations the
-    hour labels are in UK time rather than the location's local time.
+    This tool is Great-Britain-scoped: a non-GB geocode result is rejected before
+    weather lookup rather than being shown UK law as though it were local.
 
     Args:
         location: A city or place name, for example "Congleton UK".
-        drone: The drone model, for example "Mini 5 Pro", "Avata 2", or "Neo".
+        drone: The configuration, for example "Mini 5 Pro", "Mini 5 Pro Plus",
+            "Avata 2", "Neo", or "Neo FPV".
+        tool_context: Strands request context used to return the typed decision to
+            the application boundary.
 
     Returns:
         A per-hour flyability assessment with the best window, UK CAA notes, and
         tips; or a list of supported drones when the model is not recognised.
     """
-    return render(drone_flight_summary(location, drone))
+    response = drone_flight_response(location, drone)
+    _record_drone_response(tool_context, response)
+    return response.text
 
 
-@tool
-def assess_fleet_conditions(location: str) -> str:
+@tool(context=True)
+def assess_fleet_conditions(location: str, tool_context: ToolContext) -> str:
     """Assess flying conditions for every supported drone at once.
 
     Use this when the user asks about all of their drones (for example "all my
     drones", "the fleet", or "every drone") rather than naming one - it covers the
-    DJI Neo, Avata 2, and Mini 5 Pro in a single combined report, so you do not
-    need to call ``assess_drone_conditions`` once per drone.
+    explicit Neo standard/FPV and Mini 5 Pro standard/Plus configurations plus
+    Avata 2 in one report, so you do not need to call
+    ``assess_drone_conditions`` repeatedly.
 
     Returns a compact comparison: shared site context (daylight, observed METAR,
     nearby airspace) and UK CAA rules once, then each drone's wind limit, best
     flying window, and per-day outlook side by side. Always relay the disclaimer.
 
-    UK-scoped like ``assess_drone_conditions``: hourly timestamps are UK local
-    time and the guidance follows UK CAA open-category rules.
+    Great-Britain-scoped like ``assess_drone_conditions``: non-GB results are
+    rejected and the guidance follows current CAA Open Category rules.
 
     Args:
         location: A city or place name, for example "Congleton UK".
+        tool_context: Strands request context used to return the typed decision to
+            the application boundary.
 
     Returns:
         A compact side-by-side flyability comparison across all supported drones,
         with shared site context, UK CAA notes, and the safety disclaimer.
     """
-    return render(fleet_flight_summary(location))
+    response = fleet_flight_response(location)
+    _record_drone_response(tool_context, response)
+    return response.text
 
 
 @tool

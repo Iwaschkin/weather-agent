@@ -76,7 +76,7 @@ _SYSTEM_PROMPT = (
     "only, not authoritative).\n"
     "- get_elevation: terrain height.\n"
     "\n"
-    "Tool routing - drone flying (DJI Neo, Avata 2, Mini 5 Pro):\n"
+    "Tool routing - drone flying (explicit DJI Neo, Avata 2, Mini 5 Pro configurations):\n"
     "- assess_drone_conditions: one named drone.\n"
     "- assess_fleet_conditions: all the user's drones / the whole fleet.\n"
     "- list_supported_drones: which drone models are covered.\n"
@@ -134,4 +134,5 @@ def build_agent(
         model=model,
         system_prompt=_SYSTEM_PROMPT,
         tools=list(_TOOLS),
+        callback_handler=None,
     )

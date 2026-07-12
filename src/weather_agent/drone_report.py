@@ -12,6 +12,8 @@ from weather_agent.models import SiteBriefing, Verdict
 from weather_agent.reporting import describe_airspace, describe_metar, format_clock
 
 if TYPE_CHECKING:
+    from datetime import datetime
+
     from weather_agent.drone import DroneProfile
     from weather_agent.knowledge import KnowledgeSection
     from weather_agent.models import (
@@ -24,12 +26,14 @@ if TYPE_CHECKING:
         FlightWindow,
         HourAssessment,
         MetarReport,
+        SourceStatus,
     )
 
 _DEFAULT_MAX_HOURS = 12
 _VERDICT_LABELS = {
     Verdict.GOOD: "GOOD",
     Verdict.MARGINAL: "MARGINAL",
+    Verdict.UNKNOWN: "UNKNOWN",
     Verdict.NO_FLY: "NO-FLY",
 }
 
@@ -42,10 +46,17 @@ _GUST_AGREE_MS = 2.5
 _VIS_AGREE_RATIO = 0.5
 
 
+def _format_time(value: datetime) -> str:
+    return value.strftime("%Y-%m-%d %H:%M %Z")
+
+
 def _render_best_window(window: FlightWindow | None) -> str:
     if window is None:
         return "Best window: no good-to-fly hours in the forecast period."
-    return f"Best window: {window.start_time} to {window.end_time} ({window.hours} h good to fly)."
+    return (
+        f"Best window: {_format_time(window.start_time)} to {_format_time(window.end_time)} "
+        f"({window.hours} h good to fly)."
+    )
 
 
 def _render_daylight(sun_times: tuple[DayAlmanac, ...]) -> list[str]:
@@ -60,6 +71,7 @@ def _render_daylight(sun_times: tuple[DayAlmanac, ...]) -> list[str]:
 
 def _render_briefing(place_label: str, briefing: SiteBriefing) -> list[str]:
     lines = list(_render_daylight(briefing.sun_times))
+    lines.extend(_render_source_status(status) for status in briefing.source_statuses)
     if briefing.metar is not None:
         lines.append(describe_metar(place_label, briefing.metar))
         if briefing.metar_vs_forecast:
@@ -67,6 +79,12 @@ def _render_briefing(place_label: str, briefing: SiteBriefing) -> list[str]:
     if briefing.airspace or briefing.airspace_note:
         lines.append(describe_airspace(place_label, briefing.airspace, briefing.airspace_note))
     return lines
+
+
+def _render_source_status(status: SourceStatus) -> str:
+    state = status.state.value.replace("_", " ")
+    detail = f" - {status.detail}" if status.detail else ""
+    return f"Source status: {status.source} {state}{detail}."
 
 
 def _gust_reconciliation(metar: MetarReport, hour: DroneFlightHour) -> str | None:
@@ -118,14 +136,14 @@ def reconcile_metar(metar: MetarReport, hour: DroneFlightHour) -> str | None:
     ]
     if not parts:
         return None
-    return "Observed vs forecast (now): " + "; ".join(parts) + "."
+    return "Observed vs forecast at METAR time: " + "; ".join(parts) + "."
 
 
 def _render_hour(hour: HourAssessment) -> str:
     label = _VERDICT_LABELS[hour.verdict]
     if hour.limiting_factors:
-        return f"  {hour.time}  {label} - {'; '.join(hour.limiting_factors)}"
-    return f"  {hour.time}  {label}"
+        return f"  {_format_time(hour.time)}  {label} - {'; '.join(hour.limiting_factors)}"
+    return f"  {_format_time(hour.time)}  {label}"
 
 
 def _daily_rows(daily: tuple[DayOutlook, ...]) -> list[str]:
@@ -160,11 +178,16 @@ def _render_hours(hours: tuple[HourAssessment, ...], max_hours: int) -> list[str
 
 
 def _render_caa(guidance: CaaGuidance) -> list[str]:
-    lines = [f"UK CAA notes ({guidance.uk_class_label}, subcategory {guidance.subcategory}):"]
+    lines = [
+        f"UK CAA notes ({guidance.jurisdiction}; {guidance.aircraft_class}; "
+        f"subcategory {guidance.subcategory.value}):",
+        f"  Configuration: {guidance.configuration}",
+    ]
     lines.extend(f"  - {rule}" for rule in guidance.key_rules)
     lines.append(f"  Height: {guidance.height_limit_note}")
-    if guidance.class_caveat:
-        lines.append(f"  Caveat: {guidance.class_caveat}")
+    lines.append(f"  Remote ID: {guidance.remote_id_note}")
+    lines.append(f"  Rules reviewed: {guidance.reviewed_as_of:%d %B %Y}")
+    lines.append(f"  Official sources: {'; '.join(guidance.source_urls)}")
     return lines
 
 
@@ -198,6 +221,7 @@ def describe_drone_assessment(
         briefing = SiteBriefing()
     lines = [
         f"Drone flight assessment - {assessment.drone_name} at {assessment.place_label}",
+        f"Forecast times: {assessment.time_context.timezone}.",
         "",
         _render_best_window(assessment.best_window),
         *_render_briefing(assessment.place_label, briefing),
@@ -216,7 +240,9 @@ def describe_drone_assessment(
 def _window_summary(window: FlightWindow | None) -> str:
     if window is None:
         return "no good-to-fly hours"
-    return f"{window.start_time} to {window.end_time} ({window.hours} h)"
+    return (
+        f"{_format_time(window.start_time)} to {_format_time(window.end_time)} ({window.hours} h)"
+    )
 
 
 def _render_fleet_comparison(members: tuple[FleetMember, ...]) -> list[str]:
@@ -231,21 +257,24 @@ def _render_fleet_comparison(members: tuple[FleetMember, ...]) -> list[str]:
 
 def _render_fleet_member(member: FleetMember) -> list[str]:
     guidance = member.guidance
-    lines = [f"{member.profile.name} ({guidance.uk_class_label} {guidance.subcategory}):"]
+    lines = [
+        f"{member.profile.name} ({guidance.aircraft_class}, {guidance.subcategory.value}):",
+        f"  Configuration: {guidance.configuration}",
+    ]
     lines.extend(f"  {row}" for row in _daily_rows(member.assessment.daily))
-    if guidance.key_rules:
-        # key_rules[0] is the class-specific people rule; [1:] are shared (rendered once).
-        lines.append(f"  People: {guidance.key_rules[0]}")
-    if guidance.class_caveat:
-        lines.append(f"  Caveat: {guidance.class_caveat}")
+    lines.extend(f"  Rule: {rule}" for rule in guidance.key_rules)
+    lines.append(f"  Height: {guidance.height_limit_note}")
+    lines.append(f"  Remote ID: {guidance.remote_id_note}")
+    lines.append(f"  Manufacturer source: {guidance.source_urls[0]}")
     return lines
 
 
 def _render_shared_caa(reference: CaaGuidance) -> list[str]:
-    lines = ["UK CAA notes (all drones, open category):"]
-    lines.extend(f"  - {rule}" for rule in reference.key_rules[1:])
-    lines.append(f"  Height: {reference.height_limit_note}")
-    return lines
+    return [
+        f"UK CAA notes (all drones, {reference.jurisdiction}, reviewed "
+        f"{reference.reviewed_as_of:%d %B %Y}):",
+        f"  Official sources: {'; '.join(reference.source_urls)}",
+    ]
 
 
 def describe_fleet_assessment(
@@ -276,7 +305,10 @@ def describe_fleet_assessment(
     if briefing is None:
         briefing = SiteBriefing()
     reference = members[0].guidance
-    lines = [f"Fleet flight assessment - {len(members)} drones at {place_label}"]
+    lines = [
+        f"Fleet flight assessment - {len(members)} drones at {place_label}",
+        f"Forecast times: {members[0].assessment.time_context.timezone}.",
+    ]
     briefing_lines = _render_briefing(place_label, briefing)
     if briefing_lines:
         lines.extend(("", *briefing_lines))

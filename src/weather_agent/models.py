@@ -2,12 +2,44 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from enum import Enum
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
+    from datetime import date, datetime
+
+_MIN_LATITUDE = -90.0
+_MAX_LATITUDE = 90.0
+_MIN_LONGITUDE = -180.0
+_MAX_LONGITUDE = 180.0
+
+
+@dataclass(frozen=True, slots=True)
+class Coordinates:
+    """Validated WGS84 latitude and longitude used at every spatial boundary.
+
+    Values must be finite, with latitude in ``[-90, 90]`` and longitude in
+    ``[-180, 180]``. Construction is the single validation point shared by
+    geocoding, weather, aviation, airspace, and elevation calls.
+    """
+
+    latitude: float
+    longitude: float
+
+    def __post_init__(self) -> None:
+        """Reject non-finite or out-of-range coordinate pairs."""
+        if not math.isfinite(self.latitude) or not _MIN_LATITUDE <= self.latitude <= _MAX_LATITUDE:
+            message = "latitude must be finite and between -90 and 90"
+            raise ValueError(message)
+        if (
+            not math.isfinite(self.longitude)
+            or not _MIN_LONGITUDE <= self.longitude <= _MAX_LONGITUDE
+        ):
+            message = "longitude must be finite and between -180 and 180"
+            raise ValueError(message)
 
 
 @dataclass(frozen=True, slots=True)
@@ -24,8 +56,8 @@ class GeocodeResult:
             US state), or an empty string when the API omits it.
         population: Reported population, or ``None`` when unknown. Used to rank
             otherwise-equivalent matches so larger places win ties.
-        latitude: Latitude in decimal degrees.
-        longitude: Longitude in decimal degrees.
+        coordinates: Validated WGS84 coordinate pair.
+        timezone: IANA time-zone name for the resolved place.
     """
 
     name: str
@@ -33,8 +65,26 @@ class GeocodeResult:
     country_code: str
     admin1: str
     population: int | None
-    latitude: float
-    longitude: float
+    coordinates: Coordinates
+    timezone: str
+
+
+@dataclass(frozen=True, slots=True)
+class TimeContext:
+    """Provider-reported local-time metadata for one Open-Meteo response.
+
+    Attributes:
+        timezone: IANA time-zone name resolved for the requested coordinates.
+        abbreviation: Provider-supplied short zone label at response time.
+        utc_offset_seconds: Provider-supplied applied offset from UTC in seconds.
+            This is retained as response metadata; instant conversion uses the
+            IANA zone and Unix timestamps so daylight-saving changes are not
+            reconstructed from one fixed offset.
+    """
+
+    timezone: str
+    abbreviation: str
+    utc_offset_seconds: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -46,7 +96,8 @@ class CurrentWeather:
     API omits them.
 
     Attributes:
-        time: ISO-8601 timestamp of the observation, as returned by the API.
+        time: Aware local timestamp of the observation.
+        time_context: Provider-reported time-zone metadata.
         temperature_celsius: Air temperature 2 m above ground, in degrees Celsius.
         wind_speed_kmh: Wind speed 10 m above ground, in kilometres per hour.
         weather_code: WMO weather-interpretation code for the condition (for
@@ -57,7 +108,8 @@ class CurrentWeather:
         cloud_cover_pct: Total cloud cover, in percent.
     """
 
-    time: str
+    time: datetime
+    time_context: TimeContext
     temperature_celsius: float
     wind_speed_kmh: float
     weather_code: float | None
@@ -78,13 +130,16 @@ class TimeSeries:
     are represented as ``None`` because open-meteo emits JSON ``null`` for gaps.
 
     Attributes:
-        timestamps: ISO-8601 timestamps, one per row, as returned by the API.
+        timestamps: Aware datetimes for instant-based rows or calendar dates for
+            daily rows, one per row.
+        time_context: Provider-reported time-zone metadata.
         series: Mapping of variable name (for example ``"temperature_2m"``) to a
             column of values aligned with ``timestamps``.
     """
 
-    timestamps: tuple[str, ...]
+    timestamps: tuple[date | datetime, ...]
     series: Mapping[str, tuple[float | None, ...]]
+    time_context: TimeContext
 
     def column(self, variable: str) -> tuple[float | None, ...]:
         """Return the value column for a variable.
@@ -111,35 +166,37 @@ class CurrentReadings:
     the start of the day rather than "now".
 
     Attributes:
-        time: ISO-8601 timestamp of the reading, as returned by the API.
+        time: Aware local timestamp of the reading.
+        time_context: Provider-reported time-zone metadata.
         values: Mapping of variable name to its current value, with ``None`` where
             the API reports a gap.
     """
 
-    time: str
+    time: datetime
     values: Mapping[str, float | None]
+    time_context: TimeContext
 
 
 @dataclass(frozen=True, slots=True)
 class DayAlmanac:
     """Sun times for a single day at a coordinate.
 
-    Sunrise and sunset are ISO-8601 local datetimes (strings, as the API returns
-    them), so they are kept as text rather than forced through the numeric time
-    series. ``daylight_seconds`` is numeric.
+    Sunrise and sunset are aware local instants. ``daylight_seconds`` is numeric.
 
     Attributes:
-        date: The ISO-8601 calendar date (``YYYY-MM-DD``).
-        sunrise: ISO-8601 local sunrise timestamp, or an empty string when absent.
-        sunset: ISO-8601 local sunset timestamp, or an empty string when absent.
+        date: The location-local calendar date.
+        sunrise: Aware local sunrise timestamp, or ``None`` when absent.
+        sunset: Aware local sunset timestamp, or ``None`` when absent.
         daylight_seconds: Total daylight for the day, in seconds, or ``None`` when
             unavailable.
+        time_context: Provider-reported time-zone metadata.
     """
 
-    date: str
-    sunrise: str
-    sunset: str
+    date: date
+    sunrise: datetime | None
+    sunset: datetime | None
     daylight_seconds: float | None
+    time_context: TimeContext
 
 
 @dataclass(frozen=True, slots=True)
@@ -147,15 +204,17 @@ class UvIndex:
     """Ultraviolet index for a coordinate: the value now and today's peak.
 
     Attributes:
-        time: ISO-8601 timestamp of the current reading, as returned by the API.
+        time: Aware local timestamp of the current reading.
+        time_context: Provider-reported time-zone metadata.
         current: The UV index right now, or ``None`` when unavailable.
         today_max: The maximum UV index forecast for today, or ``None`` when
             unavailable. Used to warn about peak exposure even when it is mild now.
     """
 
-    time: str
+    time: datetime
     current: float | None
     today_max: float | None
+    time_context: TimeContext
 
 
 @dataclass(frozen=True, slots=True)
@@ -166,8 +225,7 @@ class HistoricalRequest:
     argument cap and so callers construct a single validated request.
 
     Attributes:
-        latitude: Latitude in decimal degrees.
-        longitude: Longitude in decimal degrees.
+        coordinates: Validated WGS84 coordinate pair.
         start_date: Inclusive ISO-8601 start date (``YYYY-MM-DD``); ERA5 covers
             from 1940 onwards.
         end_date: Inclusive ISO-8601 end date (``YYYY-MM-DD``).
@@ -175,10 +233,9 @@ class HistoricalRequest:
             ``"temperature_2m_max,precipitation_sum"``.
     """
 
-    latitude: float
-    longitude: float
-    start_date: str
-    end_date: str
+    coordinates: Coordinates
+    start_date: date
+    end_date: date
     daily: str
 
 
@@ -187,8 +244,7 @@ class ClimateRequest:
     """Parameters for an open-meteo Climate (CMIP6) daily projection query.
 
     Attributes:
-        latitude: Latitude in decimal degrees.
-        longitude: Longitude in decimal degrees.
+        coordinates: Validated WGS84 coordinate pair.
         start_date: Inclusive ISO-8601 start date (``YYYY-MM-DD``), up to 2050.
         end_date: Inclusive ISO-8601 end date (``YYYY-MM-DD``).
         daily: Comma-separated daily variable list.
@@ -196,10 +252,9 @@ class ClimateRequest:
             ``"EC_Earth3P_HR"``.
     """
 
-    latitude: float
-    longitude: float
-    start_date: str
-    end_date: str
+    coordinates: Coordinates
+    start_date: date
+    end_date: date
     daily: str
     models: str
 
@@ -227,7 +282,7 @@ class DroneFlightHour:
     geopotential height falls within the 0-500 m AGL band.
 
     Attributes:
-        time: ISO-8601 local timestamp for the hour.
+        time: Aware local timestamp for the hour.
         temperature_c: Air temperature 2 m above ground, in degrees Celsius.
         apparent_temperature_c: "Feels like" temperature, in degrees Celsius.
         wind_gust_10m_kmh: Surface wind gust 10 m above ground, in km/h.
@@ -242,9 +297,12 @@ class DroneFlightHour:
         cloud_cover_low_pct: Low-cloud cover, in percent; a high value can mean a
             cloud base low enough to crowd the 120 m ceiling or visual line of
             sight, or ``None`` when unknown.
+        unavailable_metrics: Required provider samples that were unavailable for
+            this hour. The flyability engine turns this into an explicit unknown
+            decision unless a known no-fly condition is also present.
     """
 
-    time: str
+    time: datetime
     temperature_c: float | None
     apparent_temperature_c: float | None
     wind_gust_10m_kmh: float | None
@@ -256,6 +314,7 @@ class DroneFlightHour:
     freezing_level_agl_m: float | None
     is_day: bool | None
     cloud_cover_low_pct: float | None
+    unavailable_metrics: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -266,10 +325,30 @@ class DroneForecast:
         elevation_m: Model grid surface elevation above sea level, in metres,
             used to convert pressure-level geopotential heights to AGL.
         hours: Per-hour flight metrics in chronological order.
+        time_context: Provider-reported time-zone metadata.
     """
 
     elevation_m: float
     hours: tuple[DroneFlightHour, ...]
+    time_context: TimeContext
+
+
+class RegulatoryMark(Enum):
+    """Aircraft conformity status used by the current UK Open Category rules."""
+
+    UK0 = "UK0"
+    UK1 = "UK1"
+    EU_C0 = "EU C0"
+    EU_C1 = "EU C1"
+    LEGACY = "legacy/unmarked"
+
+
+class OpenSubcategory(Enum):
+    """UK Open Category subcategory supported by a configured aircraft."""
+
+    A1 = "A1"
+    A2 = "A2"
+    A3 = "A3"
 
 
 @dataclass(frozen=True, slots=True)
@@ -283,7 +362,15 @@ class DroneProfile:
     Attributes:
         key: Short identifier, for example ``"neo"``.
         name: Human-readable model name, for example ``"DJI Neo"``.
-        weight_g: Take-off weight in grams (affects UK CAA category).
+        configuration: Exact battery/aircraft configuration represented.
+        weight_g: Take-off weight in grams for this configuration.
+        regulatory_mark: Actual mark printed for this configuration, never one
+            inferred from weight.
+        open_subcategory: Current UK Open subcategory supported by that mark.
+        mark_valid_until: Last date a transitional EU mark is recognised as its
+            corresponding UK mark, or ``None`` for a non-transitional status.
+        regulatory_source: Manufacturer source for mass and class-mark facts.
+        regulatory_reviewed_as_of: Date those configuration facts were reviewed.
         ideal_gust_ms: Gust speed below which conditions are ideal.
         caution_gust_ms: Manufacturer wind rating; above it is no-fly.
         min_temp_c: Minimum operating temperature in degrees Celsius.
@@ -295,7 +382,13 @@ class DroneProfile:
 
     key: str
     name: str
+    configuration: str
     weight_g: float
+    regulatory_mark: RegulatoryMark
+    open_subcategory: OpenSubcategory
+    mark_valid_until: date | None
+    regulatory_source: str
+    regulatory_reviewed_as_of: date
     ideal_gust_ms: float
     caution_gust_ms: float
     min_temp_c: float
@@ -330,9 +423,8 @@ class MetarReport:
 
     Attributes:
         station: ICAO station identifier (for example ``"EGCC"``).
-        latitude: Station latitude in decimal degrees.
-        longitude: Station longitude in decimal degrees.
-        observed: Observation time as reported by the API.
+        coordinates: Validated station coordinate pair.
+        observed: Aware UTC observation time.
         wind_dir_deg: Wind direction in degrees, or ``None`` when variable/calm.
         wind_speed_kt: Sustained wind speed in knots, or ``None`` when unknown.
         wind_gust_kt: Gust speed in knots, or ``None`` when none reported.
@@ -344,9 +436,8 @@ class MetarReport:
     """
 
     station: str
-    latitude: float
-    longitude: float
-    observed: str
+    coordinates: Coordinates
+    observed: datetime
     wind_dir_deg: float | None
     wind_speed_kt: float | None
     wind_gust_kt: float | None
@@ -376,17 +467,53 @@ class Airspace:
     lower_limit: str
 
 
+class SourceState(Enum):
+    """Availability state for a supplemental assessment source.
+
+    Supplemental sources add operational context but do not manufacture a
+    successful weather gate when absent. ``PARTIAL`` means the source covered
+    only part of the requested assessment window.
+    """
+
+    AVAILABLE = "available"
+    PARTIAL = "partial"
+    CURRENT_ONLY = "current_only"
+    UNAVAILABLE = "unavailable"
+    MALFORMED = "malformed"
+    NOT_CONFIGURED = "not_configured"
+    STALE = "stale"
+
+
+@dataclass(frozen=True, slots=True)
+class SourceStatus:
+    """Observed availability of one external source for an assessment.
+
+    Attributes:
+        source: Stable source label, for example ``"NOAA Kp"``.
+        state: Typed availability state.
+        detail: Concise operator-facing context, without response bodies or
+            credentials.
+    """
+
+    source: str
+    state: SourceState
+    detail: str = ""
+
+
 class Verdict(Enum):
     """A flyability verdict for a single forecast hour.
 
     Attributes:
         GOOD: Conditions are within comfortable limits.
         MARGINAL: Flyable with caution; at least one factor is borderline.
+        UNKNOWN: Required weather data is incomplete, so the hour cannot be
+            recommended.
         NO_FLY: At least one factor exceeds a safe or legal limit.
     """
 
     GOOD = "good"
     MARGINAL = "marginal"
+    UNKNOWN = "unknown"
     NO_FLY = "no_fly"
 
 
@@ -434,7 +561,7 @@ class HourAssessment:
     """The flyability verdict for one forecast hour and one drone.
 
     Attributes:
-        time: ISO-8601 local timestamp for the hour.
+        time: Aware local timestamp for the hour.
         verdict: The overall verdict (the worst of all evaluated gates).
         limiting_factors: Short reasons that produced the verdict; empty when
             the verdict is :attr:`Verdict.GOOD`.
@@ -445,7 +572,7 @@ class HourAssessment:
             reasoning beyond the flat ``limiting_factors`` strings.
     """
 
-    time: str
+    time: datetime
     verdict: Verdict
     limiting_factors: tuple[str, ...]
     governing_wind_ms: float | None
@@ -457,13 +584,13 @@ class FlightWindow:
     """A contiguous run of good-to-fly hours.
 
     Attributes:
-        start_time: ISO-8601 timestamp of the first good hour.
-        end_time: ISO-8601 timestamp of the last good hour.
+        start_time: Aware timestamp of the first good hour.
+        end_time: Aware timestamp of the last good hour.
         hours: Number of consecutive good hours.
     """
 
-    start_time: str
-    end_time: str
+    start_time: datetime
+    end_time: datetime
     hours: int
 
 
@@ -472,13 +599,13 @@ class DayOutlook:
     """A one-line flyability outlook for a single calendar day.
 
     Attributes:
-        date: The ISO-8601 calendar date (``YYYY-MM-DD``).
+        date: The location-local calendar date.
         good_hours: Number of good-to-fly hours that day.
         best_window: The best contiguous good window that day, or ``None`` when no
             hour was good.
     """
 
-    date: str
+    date: date
     good_hours: int
     best_window: FlightWindow | None
 
@@ -495,12 +622,14 @@ class DroneAssessment:
             hour was good.
         daily: A per-day outlook over the assessment window (empty when the window
             is empty), so multi-day forecasts can be skimmed day by day.
+        time_context: Provider-reported time-zone metadata for the forecast.
     """
 
     drone_name: str
     place_label: str
     hours: tuple[HourAssessment, ...]
     best_window: FlightWindow | None
+    time_context: TimeContext
     daily: tuple[DayOutlook, ...] = ()
 
 
@@ -522,6 +651,8 @@ class SiteBriefing:
             example no API key configured), or an empty string.
         metar_vs_forecast: A one-line observed-vs-forecast reconciliation note, or
             an empty string when there is no METAR or nothing comparable.
+        source_statuses: Explicit availability of supplemental sources used for
+            the assessment.
     """
 
     sun_times: tuple[DayAlmanac, ...] = ()
@@ -529,6 +660,7 @@ class SiteBriefing:
     airspace: tuple[Airspace, ...] = ()
     airspace_note: str = ""
     metar_vs_forecast: str = ""
+    source_statuses: tuple[SourceStatus, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -537,24 +669,29 @@ class CaaGuidance:
 
     Attributes:
         drone_name: The drone the guidance applies to.
-        uk_class_label: UK class marking and weight band, for example
-            ``"C0 (sub-250 g)"``.
-        subcategory: Open-category subcategory the drone can fly in, for example
-            ``"A1"``.
+        configuration: Exact configured battery/aircraft state.
+        jurisdiction: Jurisdiction in which this guidance applies.
+        aircraft_class: Explicit aircraft mark and any transition context.
+        subcategory: Current Open-category subcategory for the configuration.
         height_limit_note: The 120 m height rule and the terrain/obstacle clause.
         key_rules: Short universal operating rules.
-        class_caveat: A model-specific caveat (for example a heavier battery
-            changing the class), or an empty string when none applies.
+        remote_id_note: Applicable Remote ID date and operating requirement.
+        reviewed_as_of: Date the embedded CAA wording was last reviewed.
+        source_urls: Current official sources supporting the deterministic text.
         disclaimer: A standing reminder that this is decision support, not legal
             or airworthiness authority.
     """
 
     drone_name: str
-    uk_class_label: str
-    subcategory: str
+    configuration: str
+    jurisdiction: str
+    aircraft_class: str
+    subcategory: OpenSubcategory
     height_limit_note: str
     key_rules: tuple[str, ...]
-    class_caveat: str
+    remote_id_note: str
+    reviewed_as_of: date
+    source_urls: tuple[str, ...]
     disclaimer: str
 
 
@@ -603,12 +740,20 @@ class KpIndex:
     geomagnetic storm that can degrade GNSS accuracy and disturb drone compasses.
 
     Attributes:
-        time: Timestamp of the observation as reported by NOAA SWPC.
+        time: Aware UTC timestamp of the observation.
         kp: The planetary K-index value.
     """
 
-    time: str
+    time: datetime
     kp: float
+
+
+class KpRowKind(Enum):
+    """NOAA classification for a Kp forecast-product row."""
+
+    OBSERVED = "observed"
+    ESTIMATED = "estimated"
+    PREDICTED = "predicted"
 
 
 @dataclass(frozen=True, slots=True)
@@ -616,9 +761,13 @@ class KpForecastEntry:
     """A single predicted planetary K-index value for a future 3-hour bucket.
 
     Attributes:
-        time: NOAA SWPC timestamp for the bucket, in UTC.
-        kp: The predicted planetary K-index for that bucket.
+        time: Aware UTC timestamp at the start of the three-hour bucket.
+        kp: The planetary K-index for that bucket.
+        kind: Whether NOAA marks the row observed, estimated, or predicted.
+        noaa_scale: NOAA geomagnetic-storm scale label, or ``None`` when quiet.
     """
 
-    time: str
+    time: datetime
     kp: float
+    kind: KpRowKind
+    noaa_scale: str | None

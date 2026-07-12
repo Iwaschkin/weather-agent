@@ -49,7 +49,14 @@ _ERR_BODY = "response body is not an object"
 _ERR_MESSAGE = "missing message block"
 _ERR_CONTENT = "missing message content"
 _ERR_NOT_JSON = "message content is not JSON"
+_ERR_RESPONSE_JSON = "response is not valid JSON"
 _ERR_NOT_OBJECT = "message content is not a JSON object"
+_ERR_FIELDS = "JSON object must contain exactly faithful, understates_risk, and notes"
+_ERR_FAITHFUL = "faithful must be a boolean"
+_ERR_UNDERSTATES_RISK = "understates_risk must be a boolean"
+_ERR_NOTES_TYPE = "notes must be a string"
+_ERR_NOTES_EMPTY = "notes must not be empty"
+_JUDGE_FIELDS = frozenset({"faithful", "understates_risk", "notes"})
 
 
 class JudgeError(RuntimeError):
@@ -97,7 +104,7 @@ def facts_for_hour(hour: HourAssessment) -> str:
     return "\n".join(lines)
 
 
-def _parse_judge_response(payload: object) -> JudgeVerdict:
+def _message_content(payload: object) -> str:
     if not isinstance(payload, dict):
         raise JudgeError(_ERR_BODY)
     message = cast("dict[str, object]", payload).get("message")
@@ -106,17 +113,45 @@ def _parse_judge_response(payload: object) -> JudgeVerdict:
     content = cast("dict[str, object]", message).get("content")
     if not isinstance(content, str):
         raise JudgeError(_ERR_CONTENT)
+    return content
+
+
+def _verdict_data(content: str) -> dict[str, object]:
     try:
-        parsed = json.loads(content)
+        parsed: object = json.loads(content)
     except json.JSONDecodeError as error:
         raise JudgeError(_ERR_NOT_JSON) from error
     if not isinstance(parsed, dict):
         raise JudgeError(_ERR_NOT_OBJECT)
     data = cast("dict[str, object]", parsed)
+    if frozenset(data) != _JUDGE_FIELDS:
+        raise JudgeError(_ERR_FIELDS)
+    return data
+
+
+def _boolean_field(data: dict[str, object], name: str, error_message: str) -> bool:
+    value = data[name]
+    if not isinstance(value, bool):
+        raise JudgeError(error_message)
+    return value
+
+
+def _notes_field(data: dict[str, object]) -> str:
+    notes = data["notes"]
+    if not isinstance(notes, str):
+        raise JudgeError(_ERR_NOTES_TYPE)
+    normalized_notes = " ".join(notes.split())
+    if not normalized_notes:
+        raise JudgeError(_ERR_NOTES_EMPTY)
+    return normalized_notes
+
+
+def _parse_judge_response(payload: object) -> JudgeVerdict:
+    data = _verdict_data(_message_content(payload))
     return JudgeVerdict(
-        faithful=bool(data.get("faithful")),
-        understates_risk=bool(data.get("understates_risk")),
-        notes=str(data.get("notes", "")),
+        faithful=_boolean_field(data, "faithful", _ERR_FAITHFUL),
+        understates_risk=_boolean_field(data, "understates_risk", _ERR_UNDERSTATES_RISK),
+        notes=_notes_field(data),
     )
 
 
@@ -160,4 +195,8 @@ def ollama_faithfulness_judge(
         timeout=timeout,
     )
     _ = response.raise_for_status()
-    return _parse_judge_response(response.json())
+    try:
+        payload: object = response.json()
+    except json.JSONDecodeError as error:
+        raise JudgeError(_ERR_RESPONSE_JSON) from error
+    return _parse_judge_response(payload)

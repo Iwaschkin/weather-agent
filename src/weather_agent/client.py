@@ -5,20 +5,21 @@ responses into typed models via :mod:`weather_agent.parsing`, keeping the rest o
 the codebase free of loosely typed payloads.
 """
 
+import json
+from datetime import UTC, date, datetime, timedelta
 from typing import TYPE_CHECKING
 
 import httpx
 
 from weather_agent.parsing import (
     DRONE_HOURLY_REQUEST,
+    OpenMeteoError,
     parse_current_readings,
     parse_current_weather,
     parse_daily_almanac,
     parse_drone_forecast,
     parse_elevation,
     parse_geocode_results,
-    parse_kp,
-    parse_kp_forecast,
     parse_time_series,
     parse_uv_index,
 )
@@ -28,6 +29,7 @@ if TYPE_CHECKING:
 
     from weather_agent.models import (
         ClimateRequest,
+        Coordinates,
         CurrentReadings,
         CurrentWeather,
         DayAlmanac,
@@ -35,8 +37,6 @@ if TYPE_CHECKING:
         Elevation,
         GeocodeResult,
         HistoricalRequest,
-        KpForecastEntry,
-        KpIndex,
         TimeSeries,
         UvIndex,
     )
@@ -50,16 +50,55 @@ _MARINE_URL = "https://marine-api.open-meteo.com/v1/marine"
 _FLOOD_URL = "https://flood-api.open-meteo.com/v1/flood"
 _ENSEMBLE_URL = "https://ensemble-api.open-meteo.com/v1/ensemble"
 _ELEVATION_URL = "https://api.open-meteo.com/v1/elevation"
-_PLANETARY_KP_URL = "https://services.swpc.noaa.gov/products/noaa-planetary-k-index.json"
-_PLANETARY_KP_FORECAST_URL = (
-    "https://services.swpc.noaa.gov/products/noaa-planetary-k-index-forecast.json"
-)
 _DEFAULT_TIMEOUT = 10.0
 _DEFAULT_TIMEZONE = "Europe/London"
 _CURRENT_WEATHER_REQUEST = (
     "temperature_2m,wind_speed_10m,weather_code,"
     "relative_humidity_2m,dew_point_2m,surface_pressure,cloud_cover"
 )
+_TIME_PARAMETERS: dict[str, str] = {"timezone": "auto", "timeformat": "unixtime"}
+ARCHIVE_START_DATE = date(1940, 1, 1)
+CLIMATE_START_DATE = date(1950, 1, 1)
+CLIMATE_END_DATE = date(2050, 1, 1)
+MAX_DAILY_RANGE_DAYS = 3660
+_FORECAST_PAST_DAYS = 92
+_FORECAST_FUTURE_DAYS = 16
+_ARCHIVE_LATENCY_DAYS = 5
+
+
+def _daily_dates(series: TimeSeries) -> tuple[date, ...]:
+    dates: list[date] = []
+    for value in series.timestamps:
+        if isinstance(value, datetime):
+            message = "daily response contains an instant instead of a calendar date"
+            raise OpenMeteoError(message)
+        dates.append(value)
+    return tuple(dates)
+
+
+def _validate_daily_range(series: TimeSeries, start: date, end: date) -> None:
+    dates = _daily_dates(series)
+    if any(day < start or day > end for day in dates):
+        message = f"daily response contains dates outside {start} to {end}"
+        raise OpenMeteoError(message)
+
+
+def _validate_request_range(
+    start: date,
+    end: date,
+    lower: date,
+    upper: date,
+    label: str,
+) -> None:
+    if start > end:
+        msg = "start date must not follow end date"
+        raise ValueError(msg)
+    if start < lower or end > upper:
+        message = f"{label} dates must be between {lower} and {upper}"
+        raise ValueError(message)
+    if (end - start).days + 1 > MAX_DAILY_RANGE_DAYS:
+        message = f"{label} range must not exceed {MAX_DAILY_RANGE_DAYS} days"
+        raise ValueError(message)
 
 
 class OpenMeteoClient:
@@ -74,6 +113,7 @@ class OpenMeteoClient:
         self,
         client: httpx.Client | None = None,
         timeout: float = _DEFAULT_TIMEOUT,
+        today: date | None = None,
     ) -> None:
         """Create the client.
 
@@ -82,8 +122,11 @@ class OpenMeteoClient:
                 is created with the given timeout.
             timeout: Per-request timeout in seconds for the internally created
                 client. Ignored when ``client`` is provided.
+            today: Optional UTC reference date for dynamic provider windows. Tests
+                inject this seam; production defaults to the actual UTC date.
         """
         self._client = client if client is not None else httpx.Client(timeout=timeout)
+        self._today = today if today is not None else datetime.now(UTC).date()
 
     def _get_json(self, url: str, params: Mapping[str, str | int | float]) -> object:
         """Issue a GET request and return the decoded JSON body.
@@ -100,10 +143,16 @@ class OpenMeteoClient:
 
         Raises:
             httpx.HTTPError: If the request fails or returns an error status.
+            OpenMeteoError: If a successful response is not valid JSON.
         """
         response = self._client.get(url, params=params)
         _ = response.raise_for_status()
-        return response.json()
+        try:
+            payload: object = response.json()
+        except json.JSONDecodeError as error:
+            message = "response is not valid JSON"
+            raise OpenMeteoError(message) from error
+        return payload
 
     def geocode(self, name: str, count: int = 10) -> list[GeocodeResult]:
         """Resolve a place name to candidate coordinates.
@@ -129,12 +178,11 @@ class OpenMeteoClient:
         )
         return parse_geocode_results(payload)
 
-    def current_weather(self, latitude: float, longitude: float) -> CurrentWeather:
+    def current_weather(self, coordinates: Coordinates) -> CurrentWeather:
         """Fetch current weather for a coordinate.
 
         Args:
-            latitude: Latitude in decimal degrees.
-            longitude: Longitude in decimal degrees.
+            coordinates: Validated WGS84 coordinate pair.
 
         Returns:
             The current weather conditions at the coordinate.
@@ -146,17 +194,17 @@ class OpenMeteoClient:
         payload = self._get_json(
             _FORECAST_URL,
             {
-                "latitude": latitude,
-                "longitude": longitude,
+                "latitude": coordinates.latitude,
+                "longitude": coordinates.longitude,
                 "current": _CURRENT_WEATHER_REQUEST,
+                **_TIME_PARAMETERS,
             },
         )
         return parse_current_weather(payload)
 
     def daily_almanac(
         self,
-        latitude: float,
-        longitude: float,
+        coordinates: Coordinates,
         forecast_days: int = 1,
         timezone: str = "auto",
     ) -> tuple[DayAlmanac, ...]:
@@ -166,8 +214,7 @@ class OpenMeteoClient:
         times rather than UTC.
 
         Args:
-            latitude: Latitude in decimal degrees.
-            longitude: Longitude in decimal degrees.
+            coordinates: Validated WGS84 coordinate pair.
             forecast_days: Number of days to fetch (today onward).
             timezone: IANA timezone name, or ``"auto"`` for the location's zone.
 
@@ -181,24 +228,24 @@ class OpenMeteoClient:
         payload = self._get_json(
             _FORECAST_URL,
             {
-                "latitude": latitude,
-                "longitude": longitude,
+                "latitude": coordinates.latitude,
+                "longitude": coordinates.longitude,
                 "daily": "sunrise,sunset,daylight_duration",
                 "forecast_days": forecast_days,
                 "timezone": timezone,
+                "timeformat": "unixtime",
             },
         )
         return parse_daily_almanac(payload)
 
-    def uv_index(self, latitude: float, longitude: float) -> UvIndex:
+    def uv_index(self, coordinates: Coordinates) -> UvIndex:
         """Fetch the current UV index and today's maximum for a coordinate.
 
         Uses ``timezone=auto`` so "today" and its peak are aligned to the
         location's local day rather than UTC.
 
         Args:
-            latitude: Latitude in decimal degrees.
-            longitude: Longitude in decimal degrees.
+            coordinates: Validated WGS84 coordinate pair.
 
         Returns:
             The current UV index and today's forecast maximum.
@@ -210,20 +257,19 @@ class OpenMeteoClient:
         payload = self._get_json(
             _FORECAST_URL,
             {
-                "latitude": latitude,
-                "longitude": longitude,
+                "latitude": coordinates.latitude,
+                "longitude": coordinates.longitude,
                 "current": "uv_index",
                 "daily": "uv_index_max",
                 "forecast_days": 1,
-                "timezone": "auto",
+                **_TIME_PARAMETERS,
             },
         )
         return parse_uv_index(payload)
 
     def drone_forecast(
         self,
-        latitude: float,
-        longitude: float,
+        coordinates: Coordinates,
         forecast_days: int,
         timezone: str = _DEFAULT_TIMEZONE,
     ) -> DroneForecast:
@@ -234,8 +280,7 @@ class OpenMeteoClient:
         and the daylight flag are localised via ``timezone``.
 
         Args:
-            latitude: Latitude in decimal degrees.
-            longitude: Longitude in decimal degrees.
+            coordinates: Validated WGS84 coordinate pair.
             forecast_days: Number of forecast days to request (the drone domain
                 passes its own short window rather than a client-side default).
             timezone: IANA timezone name for localised timestamps.
@@ -250,56 +295,26 @@ class OpenMeteoClient:
         payload = self._get_json(
             _FORECAST_URL,
             {
-                "latitude": latitude,
-                "longitude": longitude,
+                "latitude": coordinates.latitude,
+                "longitude": coordinates.longitude,
                 "hourly": DRONE_HOURLY_REQUEST,
                 "forecast_days": forecast_days,
                 "timezone": timezone,
+                "timeformat": "unixtime",
             },
         )
         return parse_drone_forecast(payload)
 
-    def geomagnetic_kp(self) -> KpIndex:
-        """Fetch the latest planetary K-index from NOAA SWPC.
-
-        Unlike the open-meteo endpoints this targets the NOAA Space Weather
-        Prediction Center, but the request pattern is identical.
-
-        Returns:
-            The latest planetary K-index reading.
-
-        Raises:
-            httpx.HTTPError: If the request fails or returns an error status.
-            SpaceWeatherError: If the response shape is unexpected.
-        """
-        payload = self._get_json(_PLANETARY_KP_URL, {})
-        return parse_kp(payload)
-
-    def geomagnetic_kp_forecast(self) -> tuple[KpForecastEntry, ...]:
-        """Fetch NOAA SWPC's 3-day planetary K-index forecast.
-
-        Returns:
-            The predicted 3-hour Kp buckets (UTC) in chronological order.
-
-        Raises:
-            httpx.HTTPError: If the request fails or returns an error status.
-            SpaceWeatherError: If the response shape is unexpected.
-        """
-        payload = self._get_json(_PLANETARY_KP_FORECAST_URL, {})
-        return parse_kp_forecast(payload)
-
     def forecast_series(
         self,
-        latitude: float,
-        longitude: float,
+        coordinates: Coordinates,
         daily: str,
         forecast_days: int,
     ) -> TimeSeries:
         """Fetch a multi-day daily forecast time series.
 
         Args:
-            latitude: Latitude in decimal degrees.
-            longitude: Longitude in decimal degrees.
+            coordinates: Validated WGS84 coordinate pair.
             daily: Comma-separated daily variable list.
             forecast_days: Number of forecast days to request.
 
@@ -313,21 +328,20 @@ class OpenMeteoClient:
         payload = self._get_json(
             _FORECAST_URL,
             {
-                "latitude": latitude,
-                "longitude": longitude,
+                "latitude": coordinates.latitude,
+                "longitude": coordinates.longitude,
                 "daily": daily,
                 "forecast_days": forecast_days,
-                "timezone": "UTC",
+                **_TIME_PARAMETERS,
             },
         )
         return parse_time_series(payload, "daily")
 
     def forecast_day_series(
         self,
-        latitude: float,
-        longitude: float,
+        coordinates: Coordinates,
         daily: str,
-        day: str,
+        day: date,
     ) -> TimeSeries:
         """Fetch one calendar day's daily forecast series by explicit date.
 
@@ -336,8 +350,7 @@ class OpenMeteoClient:
         endpoint covers roughly the last 92 days through the forecast horizon.
 
         Args:
-            latitude: Latitude in decimal degrees.
-            longitude: Longitude in decimal degrees.
+            coordinates: Validated WGS84 coordinate pair.
             daily: Comma-separated daily variable list.
             day: The ISO-8601 date (``YYYY-MM-DD``) to fetch.
 
@@ -348,18 +361,30 @@ class OpenMeteoClient:
             httpx.HTTPError: If the request fails or returns an error status.
             OpenMeteoError: If the response shape is unexpected.
         """
+        _validate_request_range(
+            day,
+            day,
+            self._today - timedelta(days=_FORECAST_PAST_DAYS),
+            self._today + timedelta(days=_FORECAST_FUTURE_DAYS),
+            "forecast",
+        )
         payload = self._get_json(
             _FORECAST_URL,
             {
-                "latitude": latitude,
-                "longitude": longitude,
+                "latitude": coordinates.latitude,
+                "longitude": coordinates.longitude,
                 "daily": daily,
-                "start_date": day,
-                "end_date": day,
-                "timezone": "UTC",
+                "start_date": day.isoformat(),
+                "end_date": day.isoformat(),
+                **_TIME_PARAMETERS,
             },
         )
-        return parse_time_series(payload, "daily")
+        series = parse_time_series(payload, "daily")
+        dates = _daily_dates(series)
+        if dates != (day,):
+            message = f"explicit-day response did not contain exactly {day}"
+            raise OpenMeteoError(message)
+        return series
 
     def historical_series(self, request: HistoricalRequest) -> TimeSeries:
         """Fetch a daily historical (ERA5 archive) time series.
@@ -374,18 +399,27 @@ class OpenMeteoClient:
             httpx.HTTPError: If the request fails or returns an error status.
             OpenMeteoError: If the response shape is unexpected.
         """
+        _validate_request_range(
+            request.start_date,
+            request.end_date,
+            ARCHIVE_START_DATE,
+            self._today - timedelta(days=_ARCHIVE_LATENCY_DAYS),
+            "archive",
+        )
         payload = self._get_json(
             _ARCHIVE_URL,
             {
-                "latitude": request.latitude,
-                "longitude": request.longitude,
-                "start_date": request.start_date,
-                "end_date": request.end_date,
+                "latitude": request.coordinates.latitude,
+                "longitude": request.coordinates.longitude,
+                "start_date": request.start_date.isoformat(),
+                "end_date": request.end_date.isoformat(),
                 "daily": request.daily,
-                "timezone": "UTC",
+                **_TIME_PARAMETERS,
             },
         )
-        return parse_time_series(payload, "daily")
+        series = parse_time_series(payload, "daily")
+        _validate_daily_range(series, request.start_date, request.end_date)
+        return series
 
     def climate_projection(self, request: ClimateRequest) -> TimeSeries:
         """Fetch a daily climate (CMIP6) projection time series.
@@ -400,23 +434,32 @@ class OpenMeteoClient:
             httpx.HTTPError: If the request fails or returns an error status.
             OpenMeteoError: If the response shape is unexpected.
         """
+        _validate_request_range(
+            request.start_date,
+            request.end_date,
+            CLIMATE_START_DATE,
+            CLIMATE_END_DATE,
+            "climate",
+        )
         payload = self._get_json(
             _CLIMATE_URL,
             {
-                "latitude": request.latitude,
-                "longitude": request.longitude,
-                "start_date": request.start_date,
-                "end_date": request.end_date,
+                "latitude": request.coordinates.latitude,
+                "longitude": request.coordinates.longitude,
+                "start_date": request.start_date.isoformat(),
+                "end_date": request.end_date.isoformat(),
                 "daily": request.daily,
                 "models": request.models,
+                **_TIME_PARAMETERS,
             },
         )
-        return parse_time_series(payload, "daily")
+        series = parse_time_series(payload, "daily")
+        _validate_daily_range(series, request.start_date, request.end_date)
+        return series
 
     def air_quality_current(
         self,
-        latitude: float,
-        longitude: float,
+        coordinates: Coordinates,
         current: str,
     ) -> CurrentReadings:
         """Fetch current-hour air-quality readings.
@@ -425,8 +468,7 @@ class OpenMeteoClient:
         than the start of the day (which an hourly series would report at row 0).
 
         Args:
-            latitude: Latitude in decimal degrees.
-            longitude: Longitude in decimal degrees.
+            coordinates: Validated WGS84 coordinate pair.
             current: Comma-separated variable list (for example
                 ``"pm2_5,pm10,ozone,european_aqi"``).
 
@@ -439,19 +481,23 @@ class OpenMeteoClient:
         """
         payload = self._get_json(
             _AIR_QUALITY_URL,
-            {"latitude": latitude, "longitude": longitude, "current": current, "timezone": "UTC"},
+            {
+                "latitude": coordinates.latitude,
+                "longitude": coordinates.longitude,
+                "current": current,
+                **_TIME_PARAMETERS,
+            },
         )
         return parse_current_readings(payload)
 
-    def marine_current(self, latitude: float, longitude: float, current: str) -> CurrentReadings:
+    def marine_current(self, coordinates: Coordinates, current: str) -> CurrentReadings:
         """Fetch current-hour marine (wave) readings.
 
         Uses the ``current`` block so the readings are for the present hour rather
         than the start of the day.
 
         Args:
-            latitude: Latitude in decimal degrees.
-            longitude: Longitude in decimal degrees.
+            coordinates: Validated WGS84 coordinate pair.
             current: Comma-separated variable list (for example
                 ``"wave_height,wave_period"``).
 
@@ -464,16 +510,20 @@ class OpenMeteoClient:
         """
         payload = self._get_json(
             _MARINE_URL,
-            {"latitude": latitude, "longitude": longitude, "current": current, "timezone": "UTC"},
+            {
+                "latitude": coordinates.latitude,
+                "longitude": coordinates.longitude,
+                "current": current,
+                **_TIME_PARAMETERS,
+            },
         )
         return parse_current_readings(payload)
 
-    def river_discharge_series(self, latitude: float, longitude: float, daily: str) -> TimeSeries:
+    def river_discharge_series(self, coordinates: Coordinates, daily: str) -> TimeSeries:
         """Fetch a daily river-discharge (flood) time series.
 
         Args:
-            latitude: Latitude in decimal degrees.
-            longitude: Longitude in decimal degrees.
+            coordinates: Validated WGS84 coordinate pair.
             daily: Comma-separated daily variable list (for example
                 ``"river_discharge"``).
 
@@ -486,22 +536,25 @@ class OpenMeteoClient:
         """
         payload = self._get_json(
             _FLOOD_URL,
-            {"latitude": latitude, "longitude": longitude, "daily": daily},
+            {
+                "latitude": coordinates.latitude,
+                "longitude": coordinates.longitude,
+                "daily": daily,
+                **_TIME_PARAMETERS,
+            },
         )
         return parse_time_series(payload, "daily")
 
     def ensemble_series(
         self,
-        latitude: float,
-        longitude: float,
+        coordinates: Coordinates,
         hourly: str,
         models: str,
     ) -> TimeSeries:
         """Fetch an hourly ensemble time series with per-member columns.
 
         Args:
-            latitude: Latitude in decimal degrees.
-            longitude: Longitude in decimal degrees.
+            coordinates: Validated WGS84 coordinate pair.
             hourly: Comma-separated hourly variable list (for example
                 ``"temperature_2m"``).
             models: Ensemble model identifier (for example ``"icon_seamless"``).
@@ -516,21 +569,21 @@ class OpenMeteoClient:
         payload = self._get_json(
             _ENSEMBLE_URL,
             {
-                "latitude": latitude,
-                "longitude": longitude,
+                "latitude": coordinates.latitude,
+                "longitude": coordinates.longitude,
                 "hourly": hourly,
                 "models": models,
-                "timezone": "UTC",
+                "forecast_hours": 1,
+                **_TIME_PARAMETERS,
             },
         )
         return parse_time_series(payload, "hourly")
 
-    def elevation(self, latitude: float, longitude: float) -> Elevation:
+    def elevation(self, coordinates: Coordinates) -> Elevation:
         """Fetch terrain elevation for a coordinate.
 
         Args:
-            latitude: Latitude in decimal degrees.
-            longitude: Longitude in decimal degrees.
+            coordinates: Validated WGS84 coordinate pair.
 
         Returns:
             The terrain elevation at the coordinate.
@@ -541,7 +594,7 @@ class OpenMeteoClient:
         """
         payload = self._get_json(
             _ELEVATION_URL,
-            {"latitude": latitude, "longitude": longitude},
+            {"latitude": coordinates.latitude, "longitude": coordinates.longitude},
         )
         return parse_elevation(payload)
 

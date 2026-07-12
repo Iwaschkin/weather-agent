@@ -9,10 +9,15 @@ the agent's sliding-window manager trims the oldest turns.
 
 import logging
 import sys
+from typing import TYPE_CHECKING
 
 from dotenv import load_dotenv
 
 from weather_agent.agent import build_agent
+from weather_agent.application import DECISION_CAPTURE_KEY, DecisionCapture
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 _DEFAULT_PROMPT = "What is the current weather in Berlin?"
 _CHAT_COMMAND = "chat"
@@ -34,15 +39,31 @@ def _is_exit_command(text: str) -> bool:
 def _run_once(prompt: str) -> None:
     """Run a single query against a fresh agent (no retained memory)."""
     agent = build_agent()
-    _ = agent(prompt)
+    response = _run_agent_turn(agent, prompt)
+    if response:
+        print(response)
+
+
+def _run_agent_turn(agent: Callable[..., object], prompt: str) -> str:
+    """Run one model turn and select application-owned output when captured.
+
+    Drone tools populate a request-local capture with their typed deterministic
+    result. In that case arbitrary model prose is not shown; for every other tool,
+    the model's normal final response is returned.
+    """
+    capture = DecisionCapture()
+    result = agent(prompt, invocation_state={DECISION_CAPTURE_KEY: capture})
+    if capture.response is not None:
+        return capture.response.text
+    return str(result).strip()
 
 
 def _run_chat() -> None:
     """Run an interactive chat loop backed by one memory-retaining agent.
 
     A single agent instance is reused for every turn, so its conversation
-    history carries context forward. The agent streams its own responses to
-    stdout; this loop only handles reading input and the exit conditions.
+    history carries context forward. Each completed turn is rendered here so a
+    captured deterministic drone decision takes authority over model prose.
     """
     agent = build_agent()
     print("Weather chat — ask about weather, climate, air quality, and more.")
@@ -59,7 +80,9 @@ def _run_chat() -> None:
         if not user_input.strip():
             continue
         print("\nAssistant:")
-        _ = agent(user_input)
+        response = _run_agent_turn(agent, user_input)
+        if response:
+            print(response)
     print("\nGoodbye.")
 
 

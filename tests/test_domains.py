@@ -2,6 +2,7 @@
 
 import httpx
 
+from tests.time_helpers import epoch, time_metadata
 from weather_agent.client import OpenMeteoClient
 from weather_agent.results import render
 from weather_agent.weather import (
@@ -19,12 +20,19 @@ from weather_agent.weather import (
 
 _GEOCODE_BODY: dict[str, object] = {
     "results": [
-        {"name": "Berlin", "country": "Germany", "latitude": 52.52, "longitude": 13.41},
+        {
+            "name": "Berlin",
+            "country": "Germany",
+            "latitude": 52.52,
+            "longitude": 13.41,
+            "timezone": "Europe/Berlin",
+        },
     ],
 }
 _AIR_QUALITY_BODY: dict[str, object] = {
+    **time_metadata("Europe/Berlin", "CEST", 7200),
     "current": {
-        "time": "2026-06-15T13:00",
+        "time": epoch("2026-06-15T13:00", "Europe/Berlin"),
         "interval": 3600,
         "pm2_5": 12.0,
         "pm10": 20.0,
@@ -33,31 +41,42 @@ _AIR_QUALITY_BODY: dict[str, object] = {
     },
 }
 _MARINE_BODY: dict[str, object] = {
+    **time_metadata("Europe/Berlin", "CEST", 7200),
     "current": {
-        "time": "2026-06-15T13:00",
+        "time": epoch("2026-06-15T13:00", "Europe/Berlin"),
         "interval": 3600,
         "wave_height": 1.4,
         "wave_period": 6.0,
     },
 }
 _FLOOD_BODY: dict[str, object] = {
-    "daily": {"time": ["2026-06-15"], "river_discharge": [120.0]},
+    **time_metadata("Europe/Berlin", "CEST", 7200),
+    "daily": {
+        "time": [epoch("2026-06-15T00:00", "Europe/Berlin")],
+        "river_discharge": [120.0],
+    },
 }
 _ENSEMBLE_BODY: dict[str, object] = {
+    **time_metadata("Europe/Berlin", "CEST", 7200),
     "hourly": {
-        "time": ["2026-06-15T00:00"],
+        "time": [epoch("2026-06-15T13:00", "Europe/Berlin")],
         "temperature_2m_member01": [10.0],
         "temperature_2m_member02": [14.0],
     },
 }
 _ELEVATION_BODY: dict[str, object] = {"elevation": [38.0]}
 _UV_BODY: dict[str, object] = {
-    "current": {"time": "2026-06-15T12:00", "uv_index": 4.2},
-    "daily": {"time": ["2026-06-15"], "uv_index_max": [8.1]},
+    **time_metadata("Europe/Berlin", "CEST", 7200),
+    "current": {"time": epoch("2026-06-15T12:00", "Europe/Berlin"), "uv_index": 4.2},
+    "daily": {
+        "time": [epoch("2026-06-15T00:00", "Europe/Berlin")],
+        "uv_index_max": [8.1],
+    },
 }
 _POLLEN_BODY: dict[str, object] = {
+    **time_metadata("Europe/Berlin", "CEST", 7200),
     "current": {
-        "time": "2026-06-15T13:00",
+        "time": epoch("2026-06-15T13:00", "Europe/Berlin"),
         "interval": 3600,
         "alder_pollen": None,
         "birch_pollen": 0.0,
@@ -68,26 +87,29 @@ _POLLEN_BODY: dict[str, object] = {
     },
 }
 _SOLAR_BODY: dict[str, object] = {
+    **time_metadata("Europe/Berlin", "CEST", 7200),
     "daily": {
-        "time": ["2026-06-15"],
+        "time": [epoch("2026-06-15T00:00", "Europe/Berlin")],
         "shortwave_radiation_sum": [28.0],
         "sunshine_duration": [36000.0],
         "daylight_duration": [57600.0],
     },
 }
 _CURRENT_BODY: dict[str, object] = {
+    **time_metadata("Europe/Berlin", "CEST", 7200),
     "current": {
-        "time": "2026-06-15T12:00",
+        "time": epoch("2026-06-15T12:00", "Europe/Berlin"),
         "temperature_2m": 21.3,
         "wind_speed_10m": 9.7,
         "weather_code": 3,
     },
 }
 _SUN_BODY: dict[str, object] = {
+    **time_metadata("Europe/Berlin", "CEST", 7200),
     "daily": {
-        "time": ["2026-06-16"],
-        "sunrise": ["2026-06-16T04:43"],
-        "sunset": ["2026-06-16T21:21"],
+        "time": [epoch("2026-06-16T00:00", "Europe/Berlin")],
+        "sunrise": [epoch("2026-06-16T04:43", "Europe/Berlin")],
+        "sunset": [epoch("2026-06-16T21:21", "Europe/Berlin")],
         "daylight_duration": [59880.0],
     },
 }
@@ -111,7 +133,7 @@ def test_air_quality_summary_reports_readings() -> None:
 
     assert "Air quality for Berlin, Germany" in summary
     # Reports the present hour from the current block, not the start of the day.
-    assert "(as of 2026-06-15T13:00)" in summary
+    assert "as of 2026-06-15 13:00 CEST" in summary
     # Banded, not raw: PM2.5 12 -> fair, European AQI 33 -> fair.
     assert "PM2.5 12.0 µg/m³ (fair)" in summary
     assert "European AQI 33.0 (fair)" in summary
@@ -125,8 +147,8 @@ def test_marine_summary_reports_waves() -> None:
     assert "Wave height 1.4 m (moderate)" in summary
 
 
-def test_marine_summary_reports_inland_as_non_coastal() -> None:
-    """An open-meteo 400 (inland point) becomes a friendly non-coastal message."""
+def test_marine_summary_does_not_infer_location_type_from_bad_request() -> None:
+    """An undocumented 400 remains a provider failure, not a false inland claim."""
 
     def handler(request: httpx.Request) -> httpx.Response:
         if request.url.host.startswith("geocoding"):
@@ -137,7 +159,8 @@ def test_marine_summary_reports_inland_as_non_coastal() -> None:
 
     summary = render(marine_summary("Berlin", client=client))
 
-    assert "does not appear to be a coastal or marine location" in summary
+    assert "Could not retrieve data" in summary
+    assert "coastal or marine" not in summary
 
 
 def test_marine_summary_reports_other_errors_generically() -> None:

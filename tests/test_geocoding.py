@@ -3,7 +3,7 @@
 import pytest
 
 from weather_agent.geocoding import LocationQuery, parse_location, select_best_match
-from weather_agent.models import GeocodeResult
+from weather_agent.models import Coordinates, GeocodeResult
 
 
 def _result(
@@ -20,8 +20,8 @@ def _result(
         country_code=country_code,
         admin1=admin1,
         population=population,
-        latitude=0.0,
-        longitude=0.0,
+        coordinates=Coordinates(0.0, 0.0),
+        timezone="UTC",
     )
 
 
@@ -84,9 +84,17 @@ def test_select_best_match_honours_region_qualifier() -> None:
     assert select_best_match([paris_fr, paris_tx], "Texas") is paris_tx
 
 
-def test_select_best_match_falls_back_when_qualifier_unmatched() -> None:
-    """An unmatched qualifier falls back to the most populous candidate."""
+def test_select_best_match_rejects_unmatched_explicit_qualifier() -> None:
+    """An unmatched qualifier cannot silently select a different jurisdiction."""
     a = _result("Townsville", country="Australia", population=180000)
     b = _result("Townsville", country="Australia", population=500)
 
-    assert select_best_match([a, b], "Narnia") is a
+    assert select_best_match([a, b], "Narnia") is None
+
+
+def test_select_best_match_trusts_relevance_when_top_population_unknown() -> None:
+    """Unknown population is not evidence that a lower-ranked namesake dominates."""
+    relevant = _result("Example", country="United Kingdom", population=None)
+    populated = _result("Example", country="United States", population=1_000_000)
+
+    assert select_best_match([relevant, populated], "") is relevant

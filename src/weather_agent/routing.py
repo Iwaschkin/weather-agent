@@ -41,7 +41,7 @@ def select_data_source(target: date, today: date) -> DataSource:
 
     Args:
         target: The date the question is about.
-        today: The reference "current" date (timezone-aware UTC at the boundary).
+        today: The resolved location's current calendar date.
 
     Returns:
         :attr:`DataSource.ARCHIVE` for dates older than the archive's publication

@@ -1,11 +1,12 @@
 """Tests for drone profile lookup and the pure flyability engine."""
 
 from dataclasses import replace
-from datetime import datetime
+from datetime import UTC, date, datetime
 
 import pytest
 
-from weather_agent.drone import AVATA_2, MINI_5_PRO, NEO, find_profile
+from tests.time_helpers import LONDON_SUMMER_CONTEXT, aware
+from weather_agent.drone import AVATA_2, MINI_5_PRO, MINI_5_PRO_PLUS, NEO, NEO_FPV, find_profile
 from weather_agent.flyability import assess_forecast, assess_hour, best_window, daily_outlooks
 from weather_agent.models import (
     DroneFlightHour,
@@ -16,7 +17,7 @@ from weather_agent.models import (
 )
 
 _GOOD_HOUR = DroneFlightHour(
-    time="2026-06-16T10:00",
+    time=aware("2026-06-16T10:00"),
     temperature_c=18.0,
     apparent_temperature_c=18.0,
     wind_gust_10m_kmh=10.0,
@@ -36,9 +37,11 @@ _GOOD_HOUR = DroneFlightHour(
     [
         ("neo", NEO),
         ("DJI Neo", NEO),
+        ("Neo FPV", NEO_FPV),
         ("Avata 2", AVATA_2),
         ("mini 5 pro", MINI_5_PRO),
         ("MINI5PRO", MINI_5_PRO),
+        ("Mini 5 Pro Plus", MINI_5_PRO_PLUS),
     ],
 )
 def test_find_profile_resolves_aliases(name: str, expected: DroneProfile) -> None:
@@ -163,16 +166,16 @@ def test_assess_hour_fpv_tightens_gust_margin() -> None:
     assert non_fpv.verdict is Verdict.MARGINAL
 
 
-def test_assess_hour_visibility_threshold_adapts_to_sensing() -> None:
-    """Reduced visibility is marginal without omni sensing but fine for a LiDAR drone."""
-    hazy = replace(_GOOD_HOUR, visibility_m=6000.0)  # daytime, 6 km
+def test_assess_hour_visibility_is_not_relaxed_by_onboard_sensing() -> None:
+    """LiDAR and obstacle sensing cannot substitute for the pilot's visibility."""
+    hazy = replace(_GOOD_HOUR, visibility_m=4000.0)
 
-    neo = assess_hour(NEO, hazy)  # no omni, not low-light -> 8 km threshold
-    mini = assess_hour(MINI_5_PRO, hazy)  # omni + low-light -> 3 km threshold
+    neo = assess_hour(NEO, hazy)
+    mini = assess_hour(MINI_5_PRO, hazy)
 
     assert neo.verdict is Verdict.MARGINAL
-    assert any("visibility" in factor for factor in neo.limiting_factors)
-    assert mini.verdict is Verdict.GOOD
+    assert mini.verdict is Verdict.MARGINAL
+    assert any("visibility" in factor for factor in mini.limiting_factors)
 
 
 def test_assess_hour_marginal_on_low_cloud() -> None:
@@ -192,13 +195,61 @@ def test_assess_hour_marginal_on_high_kp() -> None:
     assert any("geomagnetic" in factor for factor in result.limiting_factors)
 
 
-def test_assess_hour_marginal_when_wind_unavailable() -> None:
-    """Missing wind data is treated cautiously, not as good."""
+def test_assess_hour_unknown_when_wind_unavailable() -> None:
+    """Missing required wind data prevents a positive recommendation."""
     no_wind = replace(_GOOD_HOUR, wind_gust_10m_kmh=None, wind_max_0_500m_kmh=None)
     result = assess_hour(MINI_5_PRO, no_wind)
 
-    assert result.verdict is Verdict.MARGINAL
+    assert result.verdict is Verdict.UNKNOWN
     assert result.governing_wind_ms is None
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"temperature_c": None},
+        {"apparent_temperature_c": None},
+        {"precipitation_mm": None},
+        {"precipitation_probability_pct": None},
+        {"visibility_m": None},
+        {"cape": None},
+        {"freezing_level_agl_m": None},
+        {"is_day": None},
+        {"cloud_cover_low_pct": None},
+    ],
+)
+def test_assess_hour_unknown_for_each_missing_core_metric(
+    changes: dict[str, float | bool | None],
+) -> None:
+    """Every required core sample fails closed to the explicit unknown state."""
+    result = assess_hour(MINI_5_PRO, replace(_GOOD_HOUR, **changes))
+
+    assert result.verdict is Verdict.UNKNOWN
+    assert result.limiting_factors
+
+
+def test_assess_hour_known_no_fly_overrides_unknown() -> None:
+    """A measured hazard remains no-fly even when another required value is absent."""
+    hour = replace(_GOOD_HOUR, precipitation_mm=1.0, visibility_m=None)
+
+    assert assess_hour(MINI_5_PRO, hour).verdict is Verdict.NO_FLY
+
+
+def test_assess_hour_does_not_create_good_kp_reading_when_unavailable() -> None:
+    """Absent supplemental Kp is omitted rather than encoded as a quiet gate."""
+    result = assess_hour(MINI_5_PRO, _GOOD_HOUR)
+
+    assert all(reading.metric != "kp" for reading in result.readings)
+
+
+def test_assess_hour_unknown_when_supporting_wind_sample_is_missing() -> None:
+    """A partial aloft wind profile cannot yield GOOD from the values that remain."""
+    hour = replace(_GOOD_HOUR, unavailable_metrics=("wind_speed_120m",))
+
+    result = assess_hour(MINI_5_PRO, hour)
+
+    assert result.verdict is Verdict.UNKNOWN
+    assert "wind_speed_120m" in " ".join(result.limiting_factors)
 
 
 def test_assess_hour_exposes_structured_readings() -> None:
@@ -224,26 +275,43 @@ def test_assess_hour_exposes_structured_readings() -> None:
 def test_best_window_finds_longest_good_run() -> None:
     """The best window is the longest contiguous run of good hours."""
     hours = (
-        HourAssessment("09:00", Verdict.NO_FLY, ("rain",), 5.0),
-        HourAssessment("10:00", Verdict.GOOD, (), 5.0),
-        HourAssessment("11:00", Verdict.GOOD, (), 5.0),
-        HourAssessment("12:00", Verdict.MARGINAL, ("gusts",), 9.0),
-        HourAssessment("13:00", Verdict.GOOD, (), 5.0),
+        HourAssessment(aware("2026-06-16T09:00"), Verdict.NO_FLY, ("rain",), 5.0),
+        HourAssessment(aware("2026-06-16T10:00"), Verdict.GOOD, (), 5.0),
+        HourAssessment(aware("2026-06-16T11:00"), Verdict.GOOD, (), 5.0),
+        HourAssessment(aware("2026-06-16T12:00"), Verdict.MARGINAL, ("gusts",), 9.0),
+        HourAssessment(aware("2026-06-16T13:00"), Verdict.GOOD, (), 5.0),
     )
 
     window = best_window(hours)
 
     assert window is not None
-    assert window.start_time == "10:00"
-    assert window.end_time == "11:00"
+    assert window.start_time == aware("2026-06-16T10:00")
+    assert window.end_time == aware("2026-06-16T11:00")
     assert window.hours == 2
 
 
 def test_best_window_none_when_never_good() -> None:
     """No good hour yields no window."""
-    hours = (HourAssessment("09:00", Verdict.NO_FLY, ("rain",), 5.0),)
+    hours = (HourAssessment(aware("2026-06-16T09:00"), Verdict.NO_FLY, ("rain",), 5.0),)
 
     assert best_window(hours) is None
+
+
+def test_best_window_excludes_unknown_hours() -> None:
+    """Incomplete hours cannot join or extend a good flying window."""
+    hours = (
+        HourAssessment(aware("2026-06-16T09:00"), Verdict.GOOD, (), 5.0),
+        HourAssessment(
+            aware("2026-06-16T10:00"), Verdict.UNKNOWN, ("visibility unavailable",), 5.0
+        ),
+        HourAssessment(aware("2026-06-16T11:00"), Verdict.GOOD, (), 5.0),
+    )
+
+    window = best_window(hours)
+
+    assert window is not None
+    assert window.hours == 1
+    assert window.start_time == aware("2026-06-16T09:00")
 
 
 def test_assess_forecast_builds_full_assessment() -> None:
@@ -251,9 +319,10 @@ def test_assess_forecast_builds_full_assessment() -> None:
     forecast = DroneForecast(
         elevation_m=120.0,
         hours=(
-            replace(_GOOD_HOUR, time="10:00"),
-            replace(_GOOD_HOUR, time="11:00", precipitation_mm=1.0),
+            replace(_GOOD_HOUR, time=aware("2026-06-16T10:00")),
+            replace(_GOOD_HOUR, time=aware("2026-06-16T11:00"), precipitation_mm=1.0),
         ),
+        time_context=LONDON_SUMMER_CONTEXT,
     )
 
     assessment = assess_forecast(MINI_5_PRO, forecast, "Congleton, England")
@@ -263,7 +332,7 @@ def test_assess_forecast_builds_full_assessment() -> None:
     assert assessment.hours[0].verdict is Verdict.GOOD
     assert assessment.hours[1].verdict is Verdict.NO_FLY
     assert assessment.best_window is not None
-    assert assessment.best_window.start_time == "10:00"
+    assert assessment.best_window.start_time == aware("2026-06-16T10:00")
 
 
 def test_assess_forecast_applies_per_hour_kp() -> None:
@@ -271,11 +340,12 @@ def test_assess_forecast_applies_per_hour_kp() -> None:
     forecast = DroneForecast(
         elevation_m=120.0,
         hours=(
-            replace(_GOOD_HOUR, time="2026-06-16T10:00"),
-            replace(_GOOD_HOUR, time="2026-06-16T11:00"),
+            replace(_GOOD_HOUR, time=aware("2026-06-16T10:00")),
+            replace(_GOOD_HOUR, time=aware("2026-06-16T11:00")),
         ),
+        time_context=LONDON_SUMMER_CONTEXT,
     )
-    kp_by_time = {"2026-06-16T11:00": 6.0}
+    kp_by_time = {aware("2026-06-16T11:00"): 6.0}
 
     assessment = assess_forecast(MINI_5_PRO, forecast, "Congleton", kp_by_time=kp_by_time)
 
@@ -289,27 +359,28 @@ def test_assess_forecast_builds_daily_outlook() -> None:
     forecast = DroneForecast(
         elevation_m=120.0,
         hours=(
-            replace(_GOOD_HOUR, time="2026-06-16T10:00"),
-            replace(_GOOD_HOUR, time="2026-06-17T10:00"),
+            replace(_GOOD_HOUR, time=aware("2026-06-16T10:00")),
+            replace(_GOOD_HOUR, time=aware("2026-06-17T10:00")),
         ),
+        time_context=LONDON_SUMMER_CONTEXT,
     )
 
     assessment = assess_forecast(MINI_5_PRO, forecast, "Congleton")
 
-    assert [day.date for day in assessment.daily] == ["2026-06-16", "2026-06-17"]
+    assert [day.date for day in assessment.daily] == [date(2026, 6, 16), date(2026, 6, 17)]
 
 
 def test_daily_outlooks_groups_and_counts_good_hours() -> None:
     """Per-day outlooks group by date and count good hours with a best window."""
     hours = (
-        HourAssessment("2026-06-16T10:00", Verdict.GOOD, (), 4.0),
-        HourAssessment("2026-06-16T11:00", Verdict.NO_FLY, ("rain",), 4.0),
-        HourAssessment("2026-06-17T09:00", Verdict.GOOD, (), 4.0),
+        HourAssessment(aware("2026-06-16T10:00"), Verdict.GOOD, (), 4.0),
+        HourAssessment(aware("2026-06-16T11:00"), Verdict.NO_FLY, ("rain",), 4.0),
+        HourAssessment(aware("2026-06-17T09:00"), Verdict.GOOD, (), 4.0),
     )
 
     outlooks = daily_outlooks(hours)
 
-    assert [day.date for day in outlooks] == ["2026-06-16", "2026-06-17"]
+    assert [day.date for day in outlooks] == [date(2026, 6, 16), date(2026, 6, 17)]
     assert outlooks[0].good_hours == 1
     assert outlooks[0].best_window is not None
     assert outlooks[1].good_hours == 1
@@ -320,42 +391,76 @@ def test_assess_forecast_drops_elapsed_hours() -> None:
     forecast = DroneForecast(
         elevation_m=120.0,
         hours=(
-            replace(_GOOD_HOUR, time="2026-06-16T08:00"),
-            replace(_GOOD_HOUR, time="2026-06-16T09:00"),
-            replace(_GOOD_HOUR, time="2026-06-16T10:00"),
+            replace(_GOOD_HOUR, time=aware("2026-06-16T08:00")),
+            replace(_GOOD_HOUR, time=aware("2026-06-16T09:00")),
+            replace(_GOOD_HOUR, time=aware("2026-06-16T10:00")),
         ),
+        time_context=LONDON_SUMMER_CONTEXT,
     )
-    now = datetime(2026, 6, 16, 9, 30)  # noqa: DTZ001
+    now = aware("2026-06-16T09:30")
 
     assessment = assess_forecast(MINI_5_PRO, forecast, "Congleton", now=now)
 
     # 09:00 (current hour) is kept; 08:00 is dropped.
     times = [hour.time for hour in assessment.hours]
-    assert times == ["2026-06-16T09:00", "2026-06-16T10:00"]
+    assert times == [aware("2026-06-16T09:00"), aware("2026-06-16T10:00")]
 
 
-def test_assess_forecast_keeps_unparseable_timestamps() -> None:
-    """An unparseable timestamp is kept rather than silently dropped."""
+def test_assess_forecast_rejects_naive_now() -> None:
+    """A naive cutoff cannot be compared to provider instants ambiguously."""
     forecast = DroneForecast(
         elevation_m=120.0,
-        hours=(replace(_GOOD_HOUR, time="not-a-timestamp"),),
+        hours=(_GOOD_HOUR,),
+        time_context=LONDON_SUMMER_CONTEXT,
     )
     now = datetime(2026, 6, 16, 9, 30)  # noqa: DTZ001
 
-    assessment = assess_forecast(MINI_5_PRO, forecast, "Congleton", now=now)
-
-    assert len(assessment.hours) == 1
+    with pytest.raises(ValueError, match="timezone-aware"):
+        _ = assess_forecast(MINI_5_PRO, forecast, "Congleton", now=now)
 
 
 def test_assess_forecast_all_past_yields_no_window() -> None:
     """When every hour has elapsed, there is no flight window."""
     forecast = DroneForecast(
         elevation_m=120.0,
-        hours=(replace(_GOOD_HOUR, time="2026-06-16T06:00"),),
+        hours=(replace(_GOOD_HOUR, time=aware("2026-06-16T06:00")),),
+        time_context=LONDON_SUMMER_CONTEXT,
     )
-    now = datetime(2026, 6, 16, 20, 0)  # noqa: DTZ001
+    now = aware("2026-06-16T20:00")
 
     assessment = assess_forecast(MINI_5_PRO, forecast, "Congleton", now=now)
 
     assert assessment.hours == ()
     assert assessment.best_window is None
+
+
+def test_best_window_breaks_across_provider_gap() -> None:
+    """Adjacent tuple rows two hours apart are not one continuous window."""
+    hours = (
+        HourAssessment(aware("2026-06-16T10:00"), Verdict.GOOD, (), 4.0),
+        HourAssessment(aware("2026-06-16T12:00"), Verdict.GOOD, (), 4.0),
+    )
+
+    window = best_window(hours)
+
+    assert window is not None
+    assert window.hours == 1
+
+
+def test_best_window_uses_instants_across_fall_back() -> None:
+    """Both repeated UK 01:00 hours remain contiguous as distinct instants."""
+    first = datetime(2026, 10, 25, 0, tzinfo=UTC).astimezone(_GOOD_HOUR.time.tzinfo)
+    second = datetime(2026, 10, 25, 1, tzinfo=UTC).astimezone(_GOOD_HOUR.time.tzinfo)
+    hours = (
+        HourAssessment(first, Verdict.GOOD, (), 4.0),
+        HourAssessment(second, Verdict.GOOD, (), 4.0),
+    )
+
+    window = best_window(hours)
+
+    assert (first.strftime("%H:%M %Z"), second.strftime("%H:%M %Z")) == (
+        "01:00 BST",
+        "01:00 GMT",
+    )
+    assert window is not None
+    assert window.hours == 2

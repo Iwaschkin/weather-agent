@@ -11,6 +11,7 @@ from dataclasses import replace
 
 import pytest
 
+from tests.time_helpers import LONDON_SUMMER_CONTEXT, aware
 from weather_agent.drone import MINI_5_PRO
 from weather_agent.evaluation import audit_drone_report, check_hour_explanation
 from weather_agent.flyability import assess_hour
@@ -19,7 +20,7 @@ from weather_agent.models import DroneAssessment, DroneFlightHour, HourAssessmen
 _SEVERITY = {Verdict.GOOD: 0, Verdict.MARGINAL: 1, Verdict.NO_FLY: 2}
 
 _CALM_HOUR = DroneFlightHour(
-    time="2026-06-16T12:00",
+    time=aware("2026-06-16T12:00"),
     temperature_c=18.0,
     apparent_temperature_c=18.0,
     wind_gust_10m_kmh=10.0,
@@ -110,8 +111,10 @@ def test_grounding_restrictive_phrasing_is_not_understating(phrase: str) -> None
 
 
 def _no_fly_assessment() -> DroneAssessment:
-    hour = HourAssessment("2026-06-16T11:00", Verdict.NO_FLY, ("gusts over the limit",), None)
-    return DroneAssessment("DJI Neo", "Site", (hour,), None)
+    hour = HourAssessment(
+        aware("2026-06-16T11:00"), Verdict.NO_FLY, ("gusts over the limit",), None
+    )
+    return DroneAssessment("DJI Neo", "Site", (hour,), None, LONDON_SUMMER_CONTEXT)
 
 
 def test_audit_flags_an_understated_report() -> None:

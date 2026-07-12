@@ -28,6 +28,7 @@ dev = [
     "pre-commit>=4.6.0",
     "pyright>=1.1.410",
     "pytest>=9.1.0",
+    "pytest-asyncio>=1.4.0",
     "pytest-cov>=7.1.0",
     "ruff>=0.15.17",
 ]
@@ -38,12 +39,6 @@ web = [
 [tool.ruff]
 # Explicit line length to avoid relying on defaults and to align CI/editor behaviour
 line-length = 100
-# The Reflex web app (web/) is a thin UI layer outside the strict src/ baseline:
-# its component/state DSL fights strict typing, and it is already outside Pyright's
-# include. Exclude it from the core lint rather than weakening any rule for src/.
-# force-exclude keeps it excluded even when pre-commit passes explicit file paths.
-extend-exclude = ["web"]
-force-exclude = true
 
 [tool.ruff.lint]
 select = [
@@ -140,6 +135,10 @@ max-complexity = 8
 #   PLR2004 literal expected values in assertions are not magic numbers
 #   S105/S106 dummy secrets in fixtures are not real credentials
 "tests/**/*.py" = ["S101", "PLR2004", "S105", "S106"]
+# Reflex's metaclass converts these annotated mutable defaults into isolated state
+# fields at class creation. ClassVar or instance initialization would change their
+# framework meaning, so retain the two field defaults and scope the exception here.
+"web/weather_dashboard/state.py" = ["RUF012"]
 
 [tool.ruff.format]
 # Explicit formatter behaviour for consistency across environments
@@ -150,10 +149,14 @@ line-ending = "lf"
 [tool.pyright]
 pythonVersion = "3.14"
 typeCheckingMode = "standard"
+venvPath = "."
+venv = ".venv"
 
 include = [
     "src",
     "tests",
+    "web/weather_dashboard/state.py",
+    "web/weather_dashboard/transform.py",
 ]
 
 exclude = [
@@ -168,6 +171,7 @@ exclude = [
 # Strict mode only where production code lives.
 strict = [
     "src",
+    "web/weather_dashboard/transform.py",
 ]
 
 # Do not turn third-party stub gaps into repo-wide noise.
@@ -239,7 +243,7 @@ reportPrivateImportUsage = "error"
 # tables, and these entries must stay after all other tool.pyright keys.)
 [[tool.pyright.executionEnvironments]]
 root = "tests"
-extraPaths = ["./src"]
+extraPaths = [".", "./src", "./web"]
 reportPrivateUsage = "none"
 reportMissingParameterType = "warning"
 reportUnknownArgumentType = "warning"
@@ -254,7 +258,9 @@ root = "."
 extraPaths = ["./src"]
 
 [tool.pytest.ini_options]
+asyncio_mode = "auto"
 testpaths = ["tests"]
+pythonpath = ["web"]
 addopts = [
     "--import-mode=importlib",
     "--cov=weather_agent",

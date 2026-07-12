@@ -1,25 +1,21 @@
-"""LLM-written drone flight reports, grounded in the deterministic assessment.
+"""Optional model commentary for deterministic drone assessments.
 
-The narrative companion to :mod:`weather_agent.drone_report` (which renders fixed
-templates): it asks a local chat model to write a short operator-facing report for
-one drone, with the engine's own facts supplied as the only grounding. The result is
-run through the deterministic faithfulness audit
-(:func:`weather_agent.evaluation.audit_drone_report`) and prefixed with the safety
-banner if it under-states a restrictive verdict - so the LLM may phrase the briefing
-but never softens a NO-FLY.
-
-This performs network I/O against an Ollama server, so it is a boundary module: it
-is not imported by pure logic, and the host/model are injectable. The deterministic
-report and the structured assessment stay the source of truth; this only narrates.
+The application renders the verdict, windows, factors, source status, legal
+context, and disclaimer directly from the typed assessment. This boundary asks a
+local model only for two short explanatory fields and rejects output that is not
+valid JSON, exceeds the field limits, or tries to make a flight decision. A
+generation failure therefore removes optional commentary; it never removes or
+replaces the authoritative result.
 """
 
 from __future__ import annotations
 
+import json
+import re
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, cast
 
 import httpx
-
-from weather_agent.evaluation import SAFETY_BANNER, audit_drone_report
 
 if TYPE_CHECKING:
     from weather_agent.models import DroneAssessment, FleetMember, FlightWindow
@@ -27,13 +23,21 @@ if TYPE_CHECKING:
 _DEFAULT_OLLAMA_HOST = "http://localhost:11434"
 _DEFAULT_MODEL = "gemma4:12b"
 _DEFAULT_TIMEOUT = 60.0
+_MAX_SUMMARY_CHARS = 280
+_MAX_PREFLIGHT_NOTE_CHARS = 180
 
-_PROMPT = """You are a drone-flight assistant. Using ONLY the FACTS below, write a \
-short, plain operator-facing report (3-5 sentences) on flying ONE drone over the \
-forecast period. State the best window if there is one, the main limiting factors, \
-and one practical recommendation. Do not invent numbers or conditions. Never make \
-the conditions sound safer than the facts; if the best window is "none", say flying \
-is not advisable in this period.
+_PROMPT = """You explain weather factors for a drone operator. The application, not you, \
+owns and displays every verdict and recommendation. Using ONLY the FACTS below, return \
+one JSON object with exactly these string fields:
+
+- "summary": one or two factual sentences explaining the main measured constraints.
+- "preflight_note": one factual reminder to recheck current observations or official \
+airspace/NOTAM information.
+
+Do not state or imply whether to fly. Do not use verdict labels, claim conditions are \
+safe/unsafe or suitable/unsuitable, or recommend/advise/prohibit flight. Do not invent \
+numbers or conditions. Keep summary under 280 characters and preflight_note under 180 \
+characters. Output JSON only.
 
 FACTS:
 {facts}
@@ -42,10 +46,31 @@ FACTS:
 _ERR_BODY = "response body is not an object"
 _ERR_MESSAGE = "missing message block"
 _ERR_CONTENT = "missing message content"
+_ERR_INVALID_JSON = "message content is not valid JSON"
+_ERR_RESPONSE_JSON = "response is not valid JSON"
+_ERR_NOT_JSON_OBJECT = "message content is not a JSON object"
+_ERR_WRONG_KEYS = "JSON object must contain exactly summary and preflight_note"
+_ERR_DECISION_LANGUAGE = "commentary contains prohibited decision language"
+_COMMENTARY_KEYS = frozenset({"summary", "preflight_note"})
+_PROHIBITED_DECISION_PATTERNS = (
+    r"\bverdict\b",
+    r"\bgood(?:-to-fly)?\b",
+    r"\bmarginal\b",
+    r"\bunknown\b",
+    r"\bno[ -]?fly\b",
+    r"\bfly(?:ing)?\b",
+    r"\bsafe(?:ty)?\b",
+    r"\bunsafe\b",
+    r"\bsuitable\b",
+    r"\bunsuitable\b",
+    r"\brecommend(?:ed|ation|ing|s)?\b",
+    r"\badvis(?:e|ed|able|ing)\b",
+    r"\bproceed\b",
+)
 
 
 class ReportError(RuntimeError):
-    """Raised when the model's report response is missing or malformed."""
+    """Raised when generated commentary violates the narrow response contract."""
 
     def __init__(self, context: str) -> None:
         """Build an error naming the part of the response that failed validation.
@@ -56,10 +81,23 @@ class ReportError(RuntimeError):
         super().__init__(f"Malformed report response: {context}")
 
 
+@dataclass(frozen=True, slots=True)
+class GeneratedCommentary:
+    """Validated, non-authoritative explanation shown after a fixed decision."""
+
+    summary: str
+    preflight_note: str
+
+    @property
+    def text(self) -> str:
+        """Render both commentary fields without adding decision language."""
+        return f"{self.summary}\n\nPre-flight note: {self.preflight_note}"
+
+
 def _window_phrase(window: FlightWindow | None) -> str:
     if window is None:
         return "none"
-    return f"{window.start_time} to {window.end_time} ({window.hours} h)"
+    return f"{window.start_time.isoformat()} to {window.end_time.isoformat()} ({window.hours} h)"
 
 
 def _limiting_factors(assessment: DroneAssessment) -> str:
@@ -71,31 +109,36 @@ def _limiting_factors(assessment: DroneAssessment) -> str:
 
 
 def facts_for_assessment(member: FleetMember) -> str:
-    """Render the engine's verdict facts for one drone as LLM grounding.
+    """Render deterministic weather facts for optional explanatory commentary.
+
+    The model receives the engine's decision context so it can identify relevant
+    measured constraints, but the output contract expressly prevents it from
+    restating or selecting a verdict.
 
     Args:
         member: The drone's profile paired with its assessment.
 
     Returns:
-        A compact, deterministic facts block (limits, best window, per-day outlook,
-        and the limiting factors observed) to anchor the generated prose.
+        A compact facts block containing limits, windows, daily counts, and
+        measured limiting factors.
     """
     profile = member.profile
     assessment = member.assessment
     lines = [
         f"Drone: {profile.name} (wind limit {profile.caution_gust_ms:.1f} m/s, "
         f"ideal below {profile.ideal_gust_ms:.1f} m/s).",
-        f"Best flying window: {_window_phrase(assessment.best_window)}.",
+        f"Application-selected best window: {_window_phrase(assessment.best_window)}.",
     ]
     if assessment.daily:
-        lines.append("Per-day outlook:")
+        lines.append("Application-computed per-day counts:")
         lines.extend(
-            f"- {day.date}: {day.good_hours} good hours, best {_window_phrase(day.best_window)}"
+            f"- {day.date}: {day.good_hours} acceptable hours; selected window "
+            f"{_window_phrase(day.best_window)}"
             for day in assessment.daily
         )
     factors = _limiting_factors(assessment)
     if factors:
-        lines.append(f"Limiting factors observed: {factors}")
+        lines.append(f"Measured limiting factors: {factors}")
     return "\n".join(lines)
 
 
@@ -106,25 +149,60 @@ def _content(payload: object) -> str:
     if not isinstance(message, dict):
         raise ReportError(_ERR_MESSAGE)
     content = cast("dict[str, object]", message).get("content")
-    if not isinstance(content, str):
+    if not isinstance(content, str) or not content.strip():
         raise ReportError(_ERR_CONTENT)
     return content.strip()
 
 
-def apply_audit(member: FleetMember, prose: str) -> str:
-    """Prefix the safety banner if the prose under-states the drone's verdict.
+def _field(payload: dict[str, object], name: str, limit: int) -> str:
+    value = payload.get(name)
+    if not isinstance(value, str):
+        context = f"{name} must be a string"
+        raise ReportError(context)
+    normalized = " ".join(value.split())
+    if not normalized:
+        context = f"{name} must not be empty"
+        raise ReportError(context)
+    if len(normalized) > limit:
+        context = f"{name} exceeds {limit} characters"
+        raise ReportError(context)
+    return normalized
+
+
+def _reject_decision_claims(commentary: GeneratedCommentary) -> None:
+    combined = f"{commentary.summary} {commentary.preflight_note}"
+    for pattern in _PROHIBITED_DECISION_PATTERNS:
+        if re.search(pattern, combined, flags=re.IGNORECASE):
+            raise ReportError(_ERR_DECISION_LANGUAGE)
+
+
+def parse_commentary(content: str) -> GeneratedCommentary:
+    """Validate a model response against the commentary-only JSON contract.
 
     Args:
-        member: The assessed drone (the decision ground truth).
-        prose: The model-written report.
+        content: Raw model message content.
 
     Returns:
-        The prose unchanged when faithful, or the banner followed by the prose when
-        the deterministic audit flags an under-stated restrictive verdict.
+        Normalized commentary when the JSON object has exactly the allowed fields.
+
+    Raises:
+        ReportError: If JSON, shape, fields, lengths, or language are invalid.
     """
-    if audit_drone_report(member.assessment, prose):
-        return f"{SAFETY_BANNER}\n\n{prose}"
-    return prose
+    try:
+        decoded = cast("object", json.loads(content))
+    except json.JSONDecodeError as error:
+        raise ReportError(_ERR_INVALID_JSON) from error
+    if not isinstance(decoded, dict):
+        raise ReportError(_ERR_NOT_JSON_OBJECT)
+    payload = cast("dict[str, object]", decoded)
+    if frozenset(payload) != _COMMENTARY_KEYS:
+        raise ReportError(_ERR_WRONG_KEYS)
+    commentary = GeneratedCommentary(
+        summary=_field(payload, "summary", _MAX_SUMMARY_CHARS),
+        preflight_note=_field(payload, "preflight_note", _MAX_PREFLIGHT_NOTE_CHARS),
+    )
+    _reject_decision_claims(commentary)
+    return commentary
 
 
 def generate_drone_report(
@@ -133,26 +211,25 @@ def generate_drone_report(
     host: str = _DEFAULT_OLLAMA_HOST,
     model: str = _DEFAULT_MODEL,
     timeout: float = _DEFAULT_TIMEOUT,
-) -> str:
-    """Generate a grounded, audited narrative report for one drone via Ollama.
+) -> GeneratedCommentary:
+    """Generate optional, strictly validated commentary through local Ollama.
 
-    Performs a blocking HTTP call to an Ollama ``/api/chat`` endpoint, so it is for
-    contexts with a running server (a UI background task, scripts); a model must be
-    pulled. The generated prose is audited and prefixed with the safety banner if it
-    under-states the verdict.
+    The deterministic decision is rendered elsewhere and remains complete when
+    this call fails. The model is asked for JSON-only explanatory fields and is
+    never asked to select or restate a verdict.
 
     Args:
-        member: The drone's profile paired with its assessment (the grounding).
+        member: The drone and assessment used as grounding.
         host: Base URL of the Ollama server.
         model: Ollama model tag to generate with.
         timeout: Per-request timeout in seconds.
 
     Returns:
-        The audited operator-facing report.
+        Validated commentary containing no flight-decision language.
 
     Raises:
         httpx.HTTPError: If the request fails or returns an error status.
-        ReportError: If the model's response is missing or malformed.
+        ReportError: If the response violates the commentary contract.
     """
     prompt = _PROMPT.format(facts=facts_for_assessment(member))
     response = httpx.post(
@@ -161,9 +238,14 @@ def generate_drone_report(
             "model": model,
             "messages": [{"role": "user", "content": prompt}],
             "stream": False,
+            "format": "json",
             "options": {"temperature": 0},
         },
         timeout=timeout,
     )
     _ = response.raise_for_status()
-    return apply_audit(member, _content(response.json()))
+    try:
+        payload: object = response.json()
+    except json.JSONDecodeError as error:
+        raise ReportError(_ERR_RESPONSE_JSON) from error
+    return parse_commentary(_content(payload))

@@ -18,7 +18,7 @@ jobs:
                   enable-cache: true
 
             - name: Sync environment
-              run: uv sync --locked
+              run: uv sync --locked --group web
 
             - name: Lint
               run: uv run ruff check .
@@ -31,3 +31,36 @@ jobs:
 
             - name: Test
               run: uv run pytest
+
+    web-build:
+        runs-on: ubuntu-latest
+        steps:
+            - uses: actions/checkout@v6
+
+            - uses: astral-sh/setup-uv@v8.2.0
+              with:
+                  enable-cache: true
+
+            - name: Install Reflex system prerequisites
+              run: |
+                  sudo apt-get update
+                  sudo apt-get install --yes unzip
+
+            - name: Sync environment with dashboard dependencies
+              run: uv sync --locked --group web
+
+            - name: Dashboard lint and format
+              run: |
+                  uv run ruff check web tests/test_web_dashboard.py
+                  uv run ruff format --check web tests/test_web_dashboard.py
+
+            - name: Dashboard tests
+              run: uv run pytest tests/test_web_dashboard.py
+
+            - name: Import dashboard
+              working-directory: web
+              run: uv run python -c "from weather_dashboard.weather_dashboard import app"
+
+            - name: Production frontend export
+              working-directory: web
+              run: uv run reflex export --frontend-only --no-zip

@@ -27,7 +27,7 @@ out downwind is easy, returning upwind is not.
 
 ## Cold weather and batteries
 
-All three drones have a published operating range of -10 to 40 degC, but cold
+All supported aircraft have a published operating range of -10 to 40 degC, but cold
 sharply reduces lithium battery capacity and voltage well before the lower limit:
 ionic transport slows and internal resistance rises, causing voltage sag, weaker
 burst power, and earlier low-battery warnings. Below about 5 degC, expect
@@ -85,26 +85,27 @@ manually if the drone behaves oddly.
 
 ## FPV flying with the Avata 2
 
-The Avata 2 (377 g, C1, official 10.7 m/s wind resistance) is an FPV drone flown
+The Avata 2 (377 g, EU C1, official 10.7 m/s wind resistance) is an FPV drone flown
 through goggles, faster and more aggressively than a camera drone, so gusts bite
 harder than the raw wind rating suggests and FPV margins should be conservative.
 Crucially, it does **not** have obstacle avoidance - only downward and backward
 visual positioning to aid stability - so treat it as having no collision
 protection. Favour Normal mode over Manual in wind, keep speed down, avoid flying
-far downwind, and use a spotter; the goggles remove your direct view of the sky
-and surroundings.
+far downwind, and use the required co-located observer; the goggles remove your
+direct view of the sky and surroundings.
 
 ## Low light, dusk and night
 
-UK rules require unaided visual line of sight, which effectively means daylight.
-The Mini 5 Pro tolerates lower light (forward LiDAR and strong sensors) better
-than the Neo or Avata 2, but low light is still riskier: obstacle avoidance
-degrades and the horizon is hard to judge. Plan to land before dusk, and remember
-golden-hour light is brief.
+UK rules allow Open Category night flight, but still require visual line of sight
+and a green flashing light kept active throughout the flight. This application's
+forecast policy recommends daylight hours only. The Mini 5 Pro's forward LiDAR
+and sensing may help detect some obstacles in lower light, but cannot replace the
+pilot's VLOS or full view of surrounding airspace; low light remains
+operationally riskier and the horizon is harder to judge.
 
 ## DJI Neo specifics
 
-The Neo is the lightest and most wind-sensitive of the three (135 g, C0, official
+The Neo is the lightest and most wind-sensitive supported aircraft (135 g, EU C0, official
 8 m/s wind resistance, -10 to 40 degC). It has **no obstacle avoidance** - only
 downward visual positioning - so never rely on it to dodge obstacles; keep it
 close, low, in light wind, and in open areas. With ~18 minutes of flight time and
@@ -118,13 +119,14 @@ omnidirectional binocular vision with forward LiDAR (the only one here with real
 obstacle sensing and useful low-light/night detection), and the longest flight
 time. Forward LiDAR has limits - it cannot detect low-reflectivity or glass
 surfaces and fails in very bright light - so it is an aid, not a guarantee. With
-the standard battery it stays under 250 g (UK C0); the Intelligent Flight Battery
-Plus adds endurance but pushes it over 250 g, changing its UK category and the
-distances you must keep from people. (The Plus battery is not sold in Europe.)
+the standard-battery configuration is an EU C0 aircraft below 250 g. DJI also
+documents a distinct Plus-battery/C1 bundle; fitting the Plus battery to a C0
+aircraft exceeds its C0 MTOM. Select the exact configuration rather than
+inferring a class mark from measured weight.
 
 ## DJI Avata 2 specifics
 
-The Avata 2 (377 g, C1, official 10.7 m/s wind resistance, -10 to 40 degC) is an
+The Avata 2 (377 g, EU C1, official 10.7 m/s wind resistance, -10 to 40 degC) is an
 FPV platform requiring goggles and a motion or FPV controller. It supports Smart,
 Low-Battery, and Failsafe Return-to-Home, but has **no obstacle avoidance** (only
 downward and backward visual positioning). Real FPV missions use more energy than

@@ -4,7 +4,7 @@ from datetime import date
 
 import pytest
 
-from weather_agent.dates import resolve_day
+from weather_agent.dates import MAX_RELATIVE_DAYS, resolve_day
 
 # 2026-06-17 is a Wednesday; all expectations below are relative to it.
 _TODAY = date(2026, 6, 17)
@@ -47,3 +47,12 @@ def test_resolve_day_weekdays(text: str, expected: date) -> None:
 def test_resolve_day_rejects_unsupported(text: str) -> None:
     """Range phrases and unrecognised text return None for the caller to handle."""
     assert resolve_day(text, _TODAY) is None
+
+
+def test_resolve_day_bounds_counted_offsets_before_arithmetic() -> None:
+    """Pathological counts and date-bound overflow return None rather than raising."""
+    assert resolve_day(f"in {MAX_RELATIVE_DAYS} days", _TODAY) is not None
+    assert resolve_day(f"in {MAX_RELATIVE_DAYS + 1} days", _TODAY) is None
+    assert resolve_day("in 999999999999999999999999 days", _TODAY) is None
+    assert resolve_day("tomorrow", date.max) is None
+    assert resolve_day("next monday", date.max) is None
