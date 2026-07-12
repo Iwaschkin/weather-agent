@@ -9,7 +9,7 @@ jobs:
     quality:
         runs-on: ubuntu-latest
         steps:
-            - uses: actions/checkout@v6
+            - uses: actions/checkout@v7
 
             # setup-uv v8+ publishes no moving major tag; pin the exact
             # release. The deployed Dependabot config keeps it current.
@@ -35,7 +35,7 @@ jobs:
     web-build:
         runs-on: ubuntu-latest
         steps:
-            - uses: actions/checkout@v6
+            - uses: actions/checkout@v7
 
             - uses: astral-sh/setup-uv@v8.2.0
               with:
